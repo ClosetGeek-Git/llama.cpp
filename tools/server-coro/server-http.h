@@ -5,22 +5,21 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <memory>
+#include <vector>
 
 struct common_params;
 
 // generator-like API for HTTP response generation
-// this object response with one of the 2 modes:
-// 1) normal response: `data` contains the full response body
-// 2) streaming response: each call to next(output) generates the next chunk
-//    when next(output) returns false, no more data after the current chunk
-//    note: some chunks can be empty, in which case no data is sent for that chunk
+// in ZMQ transport, responses are serialized to JSON and carried over a ROUTER socket.
+// streaming is internally consumed and sent back as one combined payload.
 struct server_http_res {
     std::string content_type = "application/json; charset=utf-8";
     int status = 200;
     std::string data;
     std::map<std::string, std::string> headers;
 
-    // TODO: move this to a virtual function once we have proper polymorphism support
+    // streaming is not externally chunked in ZMQ mode; if set, chunks are pulled and concatenated
     std::function<bool(std::string &)> next = nullptr;
     bool is_stream() const {
         return next != nullptr;
@@ -29,22 +28,26 @@ struct server_http_res {
     virtual ~server_http_res() = default;
 };
 
-// unique pointer, used by set_chunked_content_provider
-// httplib requires the stream provider to be stored in heap
+// unique pointer, used by transport
 using server_http_res_ptr = std::unique_ptr<server_http_res>;
 
 struct server_http_req {
-    std::map<std::string, std::string> params; // path_params + query_params
-    std::map<std::string, std::string> headers; // reserved for future use
-    std::string path; // reserved for future use
-    std::string body;
-    const std::function<bool()> & should_stop;
+    std::map<std::string, std::string> params;  // path params + query/body "params"
+    std::map<std::string, std::string> headers; // as provided by client JSON
+    std::string path;                            // absolute path from client JSON
+    std::string body;                            // raw body string
+    
+    // General interrupt signal for this request's generation.
+    // Returns true when generation should stop. Can be triggered by:
+    // - Client disconnection (socket no longer writable)
+    // - User clicking "Stop" button (future: cancel API)
+    // - Timeout or other interrupt conditions
+    // Stored by value to avoid dangling reference issues.
+    std::function<bool()> should_stop;
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);
-        if (it != params.end()) {
-            return it->second;
-        }
+        if (it != params.end()) return it->second;
         return def;
     }
 };
@@ -67,7 +70,6 @@ struct server_http_context {
     bool start();
     void stop() const;
 
-    // note: the handler should never throw exceptions
     using handler_t = std::function<server_http_res_ptr(const server_http_req & req)>;
 
     void get(const std::string & path, const handler_t & handler) const;
