@@ -5,6 +5,7 @@
 // Swoole headers
 #include "swoole.h"
 #include "swoole_coroutine_api.h"
+#include "swoole_signal.h"
 
 #include "httplib_server.h"
 
@@ -60,6 +61,10 @@ static json make_error_json(const std::string & message, int code, const std::st
         }}
     };
 }
+
+// Global pointer for signal handler access (set during start(), cleared on exit)
+static server_http_context * g_http_context = nullptr;
+static std::atomic_flag g_is_terminating = ATOMIC_FLAG_INIT;
 
 class server_http_context::Impl {
 public:
@@ -158,6 +163,28 @@ bool server_http_context::init(const common_params & params) {
     return true;
 }
 
+// Signal handler that runs in reactor context (via signalfd/kqueue)
+// Safe to call coroutine operations here
+static void http_signal_handler(int signo) {
+    if (g_is_terminating.test_and_set()) {
+        // Second signal - force immediate exit
+        fprintf(stderr, "Received second interrupt, terminating immediately.\n");
+        exit(1);
+    }
+
+    SRV_INF("%s: received signal %d, initiating shutdown...\n", __func__, signo);
+
+    if (g_http_context) {
+        // Stop the HTTP server (safe - we're in reactor context)
+        g_http_context->stop();
+
+        // Notify main thread to exit start_loop()
+        if (g_http_context->on_shutdown) {
+            g_http_context->on_shutdown();
+        }
+    }
+}
+
 bool server_http_context::start() {
     auto & srv = pimpl->srv;
 
@@ -169,10 +196,20 @@ bool server_http_context::start() {
     // We need to track if bind succeeded from inside the coroutine
     std::atomic<int> bind_result{-1};  // -1 = pending, 0 = failed, >0 = success (port number)
 
+    // Set global pointer for signal handler access
+    g_http_context = this;
+    g_is_terminating.clear();
+
     // Run HTTP server in a thread with Swoole event loop
     thread = std::thread([this, &bind_result]() {
         // Initialize Swoole event loop for this thread
         swoole_event_init(SW_EVENTLOOP_WAIT_EXIT);
+
+        // Register signal handlers using Swoole's signal API
+        // This integrates with signalfd/kqueue so callbacks run in reactor context
+        // Note: swoole_signal_set will handle blocking signals and setting up signalfd
+        swoole_signal_set(SIGINT, http_signal_handler);
+        swoole_signal_set(SIGTERM, http_signal_handler);
 
         // Create coroutine for binding and the accept loop
         swoole::Coroutine::create([](void * arg) {
@@ -207,6 +244,10 @@ bool server_http_context::start() {
 
         // Block thread, drive all coroutines
         swoole_event_wait();
+
+        // Clean up signal handlers
+        swoole_signal_set(SIGINT, nullptr);
+        swoole_signal_set(SIGTERM, nullptr);
     });
 
     // Wait for bind to complete
@@ -237,8 +278,9 @@ void server_http_context::get(const std::string & path, const server_http_contex
     auto public_endpoints = pimpl->public_endpoints;
     auto prefix = path_prefix;
     const server_http_context * parent = this;
+    std::atomic<bool> * running_ptr = &pimpl->running;
 
-    pimpl->srv->Get(pattern.c_str(), [handler, param_names, api_keys, public_endpoints, prefix, parent](const httplib_coro::Request & req, httplib_coro::Response & res) {
+    pimpl->srv->Get(pattern.c_str(), [handler, param_names, api_keys, public_endpoints, prefix, parent, running_ptr](const httplib_coro::Request & req, httplib_coro::Response & res) {
         // Check readiness (GET)
         if (!parent->is_ready.load()) {
             // Check if public endpoint
@@ -320,7 +362,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
             headers,
             req.path,
             req.body,
-            [should_stop_flag]() { return should_stop_flag->load(); }
+            [should_stop_flag, running_ptr]() { return should_stop_flag->load() || !running_ptr->load(); }
         });
 
         server_http_res_ptr response;
@@ -378,8 +420,9 @@ void server_http_context::post(const std::string & path, const server_http_conte
     auto public_endpoints = pimpl->public_endpoints;
     auto prefix = path_prefix;
     const server_http_context * parent = this;
+    std::atomic<bool> * running_ptr = &pimpl->running;
 
-    pimpl->srv->Post(pattern.c_str(), [handler, param_names, api_keys, public_endpoints, prefix, parent](const httplib_coro::Request & req, httplib_coro::Response & res) {
+    pimpl->srv->Post(pattern.c_str(), [handler, param_names, api_keys, public_endpoints, prefix, parent, running_ptr](const httplib_coro::Request & req, httplib_coro::Response & res) {
         // Check readiness (POST)
         if (!parent->is_ready.load()) {
             bool is_public = public_endpoints.count(req.path) > 0;
@@ -452,7 +495,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
             headers,
             req.path,
             req.body,
-            [should_stop_flag]() { return should_stop_flag->load(); }
+            [should_stop_flag, running_ptr]() { return should_stop_flag->load() || !running_ptr->load(); }
         });
 
         server_http_res_ptr response;

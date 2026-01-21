@@ -3,7 +3,12 @@
 
 #include "log.h"
 
+// Swoole headers for coroutine-aware eventfd waiting
+#include "swoole.h"
+#include "swoole_coroutine_api.h"
+
 #include <chrono>
+#include <cerrno>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -225,6 +230,18 @@ void server_queue::cleanup_pending_task(int id_target) {
 // server_response
 //
 
+void server_response::register_eventfd(int id_task, int efd) {
+    std::unique_lock<std::mutex> lock(mutex_eventfd);
+    task_to_eventfd[id_task] = efd;
+    RES_DBG("registered eventfd %d for task %d\n", efd, id_task);
+}
+
+void server_response::unregister_eventfd(int id_task) {
+    std::unique_lock<std::mutex> lock(mutex_eventfd);
+    task_to_eventfd.erase(id_task);
+    RES_DBG("unregistered eventfd for task %d\n", id_task);
+}
+
 void server_response::add_waiting_task_id(int id_task) {
     RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
 
@@ -290,6 +307,12 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
+        // Check running state first (for clean shutdown)
+        if (!running) {
+            RES_DBG("%s : queue shutting down, returning nullptr\n", __func__);
+            return nullptr;
+        }
+
         for (int i = 0; i < (int) queue_results.size(); i++) {
             if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
                 server_task_result_ptr res = std::move(queue_results[i]);
@@ -301,7 +324,7 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
         std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
-            std::terminate(); // we cannot return here since the caller is HTTP code
+            return nullptr;  // Return nullptr instead of terminate for clean shutdown
         }
         if (cr_res == std::cv_status::timeout) {
             return nullptr;
@@ -319,21 +342,53 @@ server_task_result_ptr server_response::recv(int id_task) {
 void server_response::send(server_task_result_ptr && result) {
     RES_DBG("sending result for task id = %d\n", result->id);
 
-    std::unique_lock<std::mutex> lock(mutex_results);
-    for (const auto & id_task : waiting_task_ids) {
-        if (result->id == id_task) {
-            RES_DBG("task id = %d pushed to result queue\n", result->id);
+    int result_id = result->id;
 
-            queue_results.emplace_back(std::move(result));
-            condition_results.notify_all();
-            return;
+    {
+        std::unique_lock<std::mutex> lock(mutex_results);
+        for (const auto & id_task : waiting_task_ids) {
+            if (result_id == id_task) {
+                RES_DBG("task id = %d pushed to result queue\n", result_id);
+
+                queue_results.emplace_back(std::move(result));
+                condition_results.notify_all();
+                break;
+            }
+        }
+    }
+
+    // Signal eventfd to wake coroutine (outside of mutex_results lock)
+    {
+        std::unique_lock<std::mutex> lock(mutex_eventfd);
+        auto it = task_to_eventfd.find(result_id);
+        if (it != task_to_eventfd.end()) {
+            uint64_t val = 1;
+            ssize_t r = write(it->second, &val, sizeof(val));
+            if (r < 0) {
+                RES_WRN("failed to signal eventfd for task %d: %s\n", result_id, strerror(errno));
+            } else {
+                RES_DBG("signaled eventfd for task %d\n", result_id);
+            }
         }
     }
 }
 
 void server_response::terminate() {
+    RES_DBG("%s", "terminating response queue\n");
     running = false;
     condition_results.notify_all();
+
+    // Signal all registered eventfds to wake up blocked coroutines
+    {
+        std::unique_lock<std::mutex> lock(mutex_eventfd);
+        for (const auto & pair : task_to_eventfd) {
+            uint64_t val = 1;
+            ssize_t r = write(pair.second, &val, sizeof(val));
+            if (r < 0) {
+                RES_WRN("failed to signal eventfd during terminate for task %d: %s\n", pair.first, strerror(errno));
+            }
+        }
+    }
 }
 
 //
@@ -347,7 +402,15 @@ void server_response_reader::post_task(server_task && task, bool front) {
     id_tasks.insert(task.id);
     states.push_back(task.create_state());
     queue_results.add_waiting_task_id(task.id);
+    // Register eventfd for coroutine-yielding wait
+    if (event_fd >= 0) {
+        queue_results.register_eventfd(task.id, event_fd);
+    }
     queue_tasks.post(std::move(task), front);
+
+    // Yield to let other coroutines post their tasks before we wait for results
+    // This enables batching of concurrent requests
+    swoole_coroutine_usleep(1);
 }
 
 void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool front) {
@@ -366,7 +429,17 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool 
     }
     GGML_ASSERT(states.size() == id_tasks.size());
     queue_results.add_waiting_task_ids(id_tasks);
+    // Register eventfd for coroutine-yielding wait
+    if (event_fd >= 0) {
+        for (const auto & id_task : id_tasks) {
+            queue_results.register_eventfd(id_task, event_fd);
+        }
+    }
     queue_tasks.post(std::move(tasks), front);
+
+    // Yield to let other coroutines post their tasks before we wait for results
+    // This enables batching of concurrent requests
+    swoole_coroutine_usleep(1);
 }
 
 bool server_response_reader::has_next() const {
@@ -377,14 +450,61 @@ bool server_response_reader::has_next() const {
 // note: if one error is received, it will stop further processing and return error result
 server_task_result_ptr server_response_reader::next(const std::function<bool()> & should_stop) {
     while (true) {
-        server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
+        // Check if the queue is shutting down
+        if (!queue_results.is_running()) {
+            SRV_DBG("%s", "queue is shutting down, returning nullptr\n");
+            return nullptr;
+        }
+
+        // Try non-blocking fetch first
+        server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, 0);
+        
         if (result == nullptr) {
-            // timeout, check stop condition
+            // No result yet, check stop condition
             if (should_stop()) {
                 SRV_DBG("%s", "stopping wait for next result due to should_stop condition\n");
                 return nullptr;
             }
-        } else {
+            
+            // Yield coroutine by waiting on eventfd with Swoole's coroutine-aware API
+            if (event_fd >= 0) {
+                uint64_t val;
+                ssize_t r = read(event_fd, &val, sizeof(val));
+                if (r < 0) {
+                    if (errno == EAGAIN) {
+                        // No data available - yield coroutine until eventfd becomes readable
+                        // swoole_coroutine_socket_wait_event will suspend this coroutine
+                        // and resume it when the eventfd is signaled (written to)
+                        int wait_result = swoole_coroutine_socket_wait_event(event_fd, SW_EVENT_READ, -1);
+                        if (wait_result < 0) {
+                            // Wait failed - could be interrupted or fd closed
+                            if (!queue_results.is_running()) {
+                                SRV_DBG("%s", "queue stopped during eventfd wait\n");
+                                return nullptr;
+                            }
+                            // Otherwise just continue the loop to retry
+                        }
+                        // After waking, try to drain the eventfd
+                        read(event_fd, &val, sizeof(val));
+                    } else {
+                        SRV_WRN("eventfd read error: %s\n", strerror(errno));
+                    }
+                }
+                // After waking, check if queue is still running
+                if (!queue_results.is_running()) {
+                    SRV_DBG("%s", "queue stopped while waiting on eventfd\n");
+                    return nullptr;
+                }
+            } else {
+                // Fallback: use polling with condition_variable timeout
+                result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
+                if (result == nullptr) {
+                    continue; // timeout, loop to check should_stop
+                }
+            }
+        }
+        
+        if (result != nullptr) {
             if (result->is_error()) {
                 stop(); // cancel remaining tasks
                 SRV_DBG("%s", "received error result, stopping further processing\n");
@@ -429,6 +549,16 @@ server_response_reader::batch_response server_response_reader::wait_for_all(cons
 }
 
 void server_response_reader::stop() {
+    // Unregister eventfd for all tasks
+    if (event_fd >= 0) {
+        for (const auto & id_task : id_tasks) {
+            queue_results.unregister_eventfd(id_task);
+        }
+        // Wake up any waiting coroutine so it can exit
+        uint64_t val = 1;
+        write(event_fd, &val, sizeof(val));
+    }
+
     queue_results.remove_waiting_task_ids(id_tasks);
     if (has_next() && !cancelled) {
         // if tasks is not finished yet, cancel them

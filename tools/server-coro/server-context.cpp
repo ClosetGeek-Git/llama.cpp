@@ -573,6 +573,8 @@ private:
     std::vector<server_slot> slots;
 
     int slots_debug = 0;
+    int batch_debug = 0;
+    uint64_t batch_id = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -809,6 +811,15 @@ private:
 
             if (slots_debug) {
                 SRV_WRN("slots debug = %d\n", slots_debug);
+            }
+        }
+
+        {
+            const char * LLAMA_BATCH_DEBUG_JSON = getenv("LLAMA_BATCH_DEBUG_JSON");
+            batch_debug = LLAMA_BATCH_DEBUG_JSON ? atoi(LLAMA_BATCH_DEBUG_JSON) : 0;
+
+            if (batch_debug) {
+                SRV_WRN("batch debug JSON = %d\n", batch_debug);
             }
         }
 
@@ -2046,6 +2057,10 @@ private:
 
         // start populating the batch for this iteration
         common_batch_clear(batch);
+        batch_id++;
+
+        // JSON batch debug: track tokens added to batch
+        json batch_tokens_json = json::array();
 
         // track if given slot can be batched with slots already in the batch
         server_slot * slot_batched = nullptr;
@@ -2113,6 +2128,21 @@ private:
                 slot.i_batch = batch.n_tokens;
 
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
+
+                // batch debug: log generating token
+                if (batch_debug) {
+                    batch_tokens_json.push_back({
+                        {"type", "generate"},
+                        {"slot_id", slot.id},
+                        {"seq_id", slot.id},
+                        {"task_id", slot.task ? slot.task->id : -1},
+                        {"token_id", slot.sampled},
+                        {"token_piece", common_token_to_piece(ctx, slot.sampled, true)},
+                        {"pos", slot.prompt.tokens.pos_next() - 1},
+                        {"i_batch", slot.i_batch},
+                        {"n_decoded", slot.n_decoded}
+                    });
+                }
 
                 slot.prompt.tokens.push_back(slot.sampled);
 
@@ -2528,6 +2558,22 @@ private:
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
                             slot.task->need_embd());
+
+                        // batch debug: log prompt token
+                        if (batch_debug >= 2) {
+                            batch_tokens_json.push_back({
+                                {"type", "prompt"},
+                                {"slot_id", slot.id},
+                                {"seq_id", slot.id},
+                                {"task_id", slot.task ? slot.task->id : -1},
+                                {"token_id", cur_tok},
+                                {"token_piece", common_token_to_piece(ctx, cur_tok, true)},
+                                {"pos", slot.prompt.tokens.pos_next() - 1},
+                                {"i_batch", batch.n_tokens - 1},
+                                {"prompt_idx", slot.prompt.n_tokens()}
+                            });
+                        }
+
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -2605,6 +2651,55 @@ private:
         }
 
         SRV_DBG("decoding batch, n_tokens = %d\n", batch.n_tokens);
+
+        // batch debug: emit JSON log before decode
+        if (batch_debug && batch.n_tokens > 0) {
+            // collect per-sequence stats
+            json seq_stats = json::object();
+            for (int32_t i = 0; i < batch.n_tokens; i++) {
+                for (int32_t s = 0; s < batch.n_seq_id[i]; s++) {
+                    llama_seq_id sid = batch.seq_id[i][s];
+                    std::string sid_str = std::to_string(sid);
+                    if (!seq_stats.contains(sid_str)) {
+                        seq_stats[sid_str] = {
+                            {"n_tokens", 0},
+                            {"pos_min", INT32_MAX},
+                            {"pos_max", INT32_MIN},
+                            {"output_count", 0}
+                        };
+                    }
+                    seq_stats[sid_str]["n_tokens"] = seq_stats[sid_str]["n_tokens"].get<int>() + 1;
+                    int32_t p = batch.pos[i];
+                    if (p < seq_stats[sid_str]["pos_min"].get<int>()) seq_stats[sid_str]["pos_min"] = p;
+                    if (p > seq_stats[sid_str]["pos_max"].get<int>()) seq_stats[sid_str]["pos_max"] = p;
+                    if (batch.logits[i]) {
+                        seq_stats[sid_str]["output_count"] = seq_stats[sid_str]["output_count"].get<int>() + 1;
+                    }
+                }
+            }
+
+            // collect unique seq_ids
+            json seq_ids = json::array();
+            for (auto & [k, v] : seq_stats.items()) {
+                seq_ids.push_back(std::stoi(k));
+            }
+
+            json batch_log = {
+                {"event", "BATCH_DECODE"},
+                {"batch_id", batch_id},
+                {"n_tokens", batch.n_tokens},
+                {"n_seqs", seq_ids.size()},
+                {"seq_ids", seq_ids},
+                {"seq_stats", seq_stats},
+                {"timestamp_us", ggml_time_us()}
+            };
+
+            if (batch_debug >= 2) {
+                batch_log["tokens"] = batch_tokens_json;
+            }
+
+            fprintf(stderr, "[BATCH_DEBUG] %s\n", batch_log.dump().c_str());
+        }
 
         if (slot_batched) {
             // apply lora, only need to do it once per batch
@@ -2766,6 +2861,29 @@ private:
 
                 llama_token id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
 
+                // batch debug: log sampling result
+                if (batch_debug) {
+                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
+                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
+
+                    json sample_log = {
+                        {"event", "SAMPLE"},
+                        {"batch_id", batch_id},
+                        {"slot_id", slot.id},
+                        {"seq_id", slot.id},
+                        {"task_id", slot.task ? slot.task->id : -1},
+                        {"tok_idx", tok_idx},
+                        {"sampled_token_id", id},
+                        {"sampled_token_piece", common_token_to_piece(ctx, id, true)},
+                        {"kv_pos_min", pos_min},
+                        {"kv_pos_max", pos_max},
+                        {"n_decoded", slot.n_decoded + 1},
+                        {"timestamp_us", ggml_time_us()}
+                    };
+
+                    fprintf(stderr, "[BATCH_DEBUG] %s\n", sample_log.dump().c_str());
+                }
+
                 slot.i_batch = -1;
 
                 common_sampler_accept(slot.smpl.get(), id, true);
@@ -2857,6 +2975,48 @@ private:
             }
         }
 
+        // batch debug: emit end-of-cycle log
+        if (batch_debug && batch.n_tokens > 0) {
+            json slots_state = json::array();
+            for (const auto & slot : slots) {
+                const char * state_str = "unknown";
+                switch (slot.state) {
+                    case SLOT_STATE_IDLE:              state_str = "idle"; break;
+                    case SLOT_STATE_WAIT_OTHER:        state_str = "wait_other"; break;
+                    case SLOT_STATE_STARTED:           state_str = "started"; break;
+                    case SLOT_STATE_PROCESSING_PROMPT: state_str = "processing_prompt"; break;
+                    case SLOT_STATE_DONE_PROMPT:       state_str = "done_prompt"; break;
+                    case SLOT_STATE_GENERATING:        state_str = "generating"; break;
+                }
+
+                json slot_info = {
+                    {"slot_id", slot.id},
+                    {"state", state_str},
+                    {"n_decoded", slot.n_decoded}
+                };
+
+                if (slot.is_processing()) {
+                    slot_info["task_id"] = slot.task ? slot.task->id : -1;
+                    slot_info["n_prompt_tokens"] = slot.prompt.n_tokens();
+                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
+                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
+                    slot_info["kv_pos_min"] = pos_min;
+                    slot_info["kv_pos_max"] = pos_max;
+                }
+
+                slots_state.push_back(slot_info);
+            }
+
+            json end_log = {
+                {"event", "BATCH_COMPLETE"},
+                {"batch_id", batch_id},
+                {"slots", slots_state},
+                {"timestamp_us", ggml_time_us()}
+            };
+
+            fprintf(stderr, "[BATCH_DEBUG] %s\\n", end_log.dump().c_str());
+        }
+
         SRV_DBG("%s", "run slots completed\n");
     }
 
@@ -2887,6 +3047,7 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+    impl->queue_results.terminate();
 }
 
 llama_context * server_context::get_llama_context() const {

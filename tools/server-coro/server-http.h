@@ -63,6 +63,10 @@ struct server_http_context {
     std::string hostname;
     int port;
 
+    // Shutdown callback - called from signal handler in reactor context
+    // Used to notify main thread (e.g., ctx_server.terminate())
+    std::function<void()> on_shutdown;
+
     server_http_context();
     ~server_http_context();
 

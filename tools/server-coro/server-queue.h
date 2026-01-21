@@ -7,6 +7,10 @@
 #include <mutex>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
+
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
@@ -121,7 +125,17 @@ private:
     std::mutex mutex_results;
     std::condition_variable condition_results;
 
+    // eventfd registration for coroutine-based waiting
+    // maps task_id -> eventfd (dedicated lock for cross-thread access from decode thread)
+    std::unordered_map<int, int> task_to_eventfd;
+    std::mutex mutex_eventfd;
+
 public:
+    // Register an eventfd for a task to enable coroutine-yielding wait
+    void register_eventfd(int id_task, int efd);
+
+    // Unregister eventfd when task is done or cancelled
+    void unregister_eventfd(int id_task);
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task);
 
@@ -148,6 +162,11 @@ public:
 
     // terminate the waiting loop
     void terminate();
+
+    // check if the response queue is still running
+    bool is_running() const {
+        return running;
+    }
 };
 
 // utility class to make working with server_queue and server_response easier
@@ -161,15 +180,28 @@ struct server_response_reader {
     bool cancelled = false;
     int polling_interval_seconds;
 
+    // eventfd for coroutine-yielding wait (signaled by decode thread when results ready)
+    int event_fd = -1;
+
     // tracking generation state and partial tool calls
     // only used by streaming completions
     std::vector<task_result_state> states;
 
     // should_stop function will be called each polling_interval_seconds
+    // TODO: timeout support via poll() on event_fd needs to be implemented
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
-        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {}
+        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {
+        event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (event_fd < 0) {
+            LOG_WRN("eventfd creation failed, falling back to polling mode: %s\n", strerror(errno));
+        }
+    }
     ~server_response_reader() {
         stop();
+        if (event_fd >= 0) {
+            close(event_fd);
+            event_fd = -1;
+        }
     }
 
     int get_new_id() {

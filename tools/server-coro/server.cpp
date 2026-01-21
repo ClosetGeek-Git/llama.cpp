@@ -9,26 +9,7 @@
 
 #include <atomic>
 #include <exception>
-#include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
-
-#if defined(_WIN32)
-#include <windows.h>
-#endif
-
-static std::function<void(int)> shutdown_handler;
-static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
-
-static inline void signal_handler(int signal) {
-    if (is_terminating.test_and_set()) {
-        // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
-        // this is for better developer experience, we can remove when the server is stable enough
-        fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
-    }
-
-    shutdown_handler(signal);
-}
 
 // wrapper function that handles exceptions and logs errors
 // this is to make sure handler_t never throws exceptions; instead, it returns an error response
@@ -213,16 +194,15 @@ int main(int argc, char ** argv) {
             llama_backend_free();
         };
 
+        // Set shutdown callback for router mode (no ctx_server to terminate)
+        ctx_http.on_shutdown = nullptr;  // Just stopping HTTP is enough
+
         if (!ctx_http.start()) {
             clean_up();
             LOG_ERR("%s: exiting due to HTTP server error\n", __func__);
             return 1;
         }
         ctx_http.is_ready.store(true);
-
-        shutdown_handler = [&](int) {
-            ctx_http.stop();
-        };
 
     } else {
         // setup clean up function, to be called before exit
@@ -231,6 +211,11 @@ int main(int argc, char ** argv) {
             ctx_http.stop();
             ctx_server.terminate();
             llama_backend_free();
+        };
+
+        // Set shutdown callback to terminate server context when signal received
+        ctx_http.on_shutdown = [&ctx_server]() {
+            ctx_server.terminate();
         };
 
         // start the HTTP server before loading the model to be able to serve /health requests
@@ -256,27 +241,10 @@ int main(int argc, char ** argv) {
         ctx_http.is_ready.store(true);
 
         LOG_INF("%s: model loaded\n", __func__);
-
-        shutdown_handler = [&](int) {
-            // this will unblock start_loop()
-            ctx_server.terminate();
-        };
     }
 
-    // TODO: refactor in common/console
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
-    struct sigaction sigint_action;
-    sigint_action.sa_handler = signal_handler;
-    sigemptyset (&sigint_action.sa_mask);
-    sigint_action.sa_flags = 0;
-    sigaction(SIGINT, &sigint_action, NULL);
-    sigaction(SIGTERM, &sigint_action, NULL);
-#elif defined (_WIN32)
-    auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-        return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
-    };
-    SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
-#endif
+    // Signal handling is now done in the HTTP thread using Swoole's signal API
+    // (see server-http.cpp http_signal_handler)
 
     if (is_router_server) {
         LOG_INF("%s: router server is listening on %s\n", __func__, ctx_http.listening_address.c_str());
@@ -296,7 +264,12 @@ int main(int argc, char ** argv) {
         const char * router_port = std::getenv("LLAMA_SERVER_ROUTER_PORT");
         std::thread monitor_thread;
         if (router_port != nullptr) {
-            monitor_thread = server_models::setup_child_server(shutdown_handler);
+            // Create a shutdown handler for child server mode
+            auto child_shutdown_handler = [&ctx_http, &ctx_server](int) {
+                ctx_http.stop();
+                ctx_server.terminate();
+            };
+            monitor_thread = server_models::setup_child_server(child_shutdown_handler);
         }
 
         // this call blocks the main thread until queue_tasks.terminate() is called
