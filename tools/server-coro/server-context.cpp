@@ -3577,7 +3577,7 @@ void server_routes::init_routes() {
             }
         }
 
-        res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
+        res->set_header("Process-Start-Time-Unix", std::to_string(res_task->t_start));
         res->content_type = "text/plain; version=0.0.4";
         res->status = 200;
         res->data = prometheus.str();

@@ -993,7 +993,7 @@ server_http_proxy::server_http_proxy(
         const std::string & host,
         int port,
         const std::string & path,
-        const std::map<std::string, std::string> & headers,
+        const http_headers_t & headers,
         const std::string & body,
         const std::function<bool()> should_stop,
         int32_t timeout_read,
@@ -1037,7 +1037,8 @@ server_http_proxy::server_http_proxy(
                 msg.content_type = value;
                 continue;
             }
-            msg.headers[key] = value;
+            // PSR-7: support multi-value headers
+            msg.headers[key].push_back(value);
         }
         return pipe->write(std::move(msg)); // send headers first
     };
@@ -1052,8 +1053,11 @@ server_http_proxy::server_http_proxy(
     {
         req.method = method;
         req.path = path;
-        for (const auto & [key, value] : headers) {
-            req.set_header(key, value);
+        // PSR-7: copy multi-value headers
+        for (const auto & [key, values] : headers) {
+            for (const auto & value : values) {
+                req.set_header(key, value);
+            }
         }
         req.body = body;
         req.response_handler = response_handler;

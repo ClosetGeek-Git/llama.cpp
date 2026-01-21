@@ -1,6 +1,7 @@
 #include "common.h"
 #include "server-http.h"
 #include "server-common.h"
+#include "server-context.h"
 
 // Swoole headers
 #include "swoole.h"
@@ -126,6 +127,20 @@ server_http_context::server_http_context()
 {}
 
 server_http_context::~server_http_context() = default;
+
+std::vector<uint8_t> server_http_context::get_slot_state(int slot_id) {
+    if (!ctx_server) {
+        return {};
+    }
+    return ctx_server->get_slot_state(slot_id);
+}
+
+size_t server_http_context::set_slot_state(int slot_id, const std::vector<uint8_t> & state_data) {
+    if (!ctx_server) {
+        return 0;
+    }
+    return ctx_server->set_slot_state(slot_id, state_data);
+}
 
 bool server_http_context::init(const common_params & params) {
     path_prefix = params.api_prefix;
@@ -338,36 +353,66 @@ void server_http_context::get(const std::string & path, const server_http_contex
         }
 
         // Build server_http_req from httplib_coro::Request
-        std::map<std::string, std::string> params;
+        server_http_req request;
 
-        // Extract path parameters from regex matches
-        for (size_t i = 0; i < param_names.size() && i + 1 < req.matches.size(); i++) {
-            params[param_names[i]] = req.matches[i + 1].str();
+        // PSR-7 core fields
+        request.method = req.method;
+        request.request_target = req.target;
+        request.path = req.path;
+        request.body = req.body;
+
+        // Extract protocol version from "HTTP/1.1" format
+        if (req.version.size() > 5 && req.version.rfind("HTTP/", 0) == 0) {
+            request.protocol_version = req.version.substr(5);
         }
 
-        // Copy query params
-        for (const auto & [k, v] : req.params) {
-            params[k] = v;
+        // Extract query string from target
+        auto query_pos = req.target.find('?');
+        if (query_pos != std::string::npos) {
+            request.query_string = req.target.substr(query_pos + 1);
         }
 
-        // Copy headers
-        std::map<std::string, std::string> headers;
+        // PSR-7 server request fields
+        request.remote_addr = req.remote_addr;
+        request.remote_port = req.remote_port;
+
+        // Parse host header for host/port
+        std::string host_header = req.get_header_value("Host");
+        if (!host_header.empty()) {
+            auto colon_pos = host_header.find(':');
+            if (colon_pos != std::string::npos) {
+                request.host = host_header.substr(0, colon_pos);
+                try {
+                    request.port = std::stoi(host_header.substr(colon_pos + 1));
+                } catch (...) {
+                    request.port = 0;
+                }
+            } else {
+                request.host = host_header;
+            }
+        }
+
+        // Copy headers with multi-value support (PSR-7)
         for (const auto & [k, v] : req.headers) {
-            headers[k] = v;
+            request.headers[k].push_back(v);
+        }
+
+        // Copy params: path params first, then query params
+        for (size_t i = 0; i < param_names.size() && i + 1 < req.matches.size(); i++) {
+            request.params[param_names[i]] = req.matches[i + 1].str();
+        }
+        for (const auto & [k, v] : req.params) {
+            request.params[k] = v;
         }
 
         auto should_stop_flag = std::make_shared<std::atomic<bool>>(false);
-        auto request = std::make_shared<server_http_req>(server_http_req{
-            params,
-            headers,
-            req.path,
-            req.body,
-            [should_stop_flag, running_ptr]() { return should_stop_flag->load() || !running_ptr->load(); }
-        });
+        request.should_stop = [should_stop_flag, running_ptr]() { return should_stop_flag->load() || !running_ptr->load(); };
+
+        auto request_ptr = std::make_shared<server_http_req>(std::move(request));
 
         server_http_res_ptr response;
         try {
-            response = handler(*request);
+            response = handler(*request_ptr);
         } catch (const std::exception & e) {
             res.status = 500;
             res.set_content(
@@ -377,15 +422,18 @@ void server_http_context::get(const std::string & path, const server_http_contex
             return;
         }
 
-        for (const auto & [k, v] : response->headers) {
-            res.set_header(k.c_str(), v.c_str());
+        // Write multi-value headers (PSR-7)
+        for (const auto & [k, values] : response->headers) {
+            for (const auto & v : values) {
+                res.set_header(k.c_str(), v.c_str());
+            }
         }
 
         if (response->is_stream()) {
             res.status = response->status;
             auto resp_shared = std::shared_ptr<server_http_res>(std::move(response));
             res.set_chunked_content_provider(
-                [resp_shared, request, should_stop_flag](size_t offset, httplib_coro::DataSink & sink) {
+                [resp_shared, request_ptr, should_stop_flag](size_t offset, httplib_coro::DataSink & sink) {
                     if (!sink.is_writable()) {
                         should_stop_flag->store(true);
                         return false;
@@ -476,31 +524,67 @@ void server_http_context::post(const std::string & path, const server_http_conte
             }
         }
 
-        std::map<std::string, std::string> params;
-        for (size_t i = 0; i < param_names.size() && i + 1 < req.matches.size(); i++) {
-            params[param_names[i]] = req.matches[i + 1].str();
-        }
-        for (const auto & [k, v] : req.params) {
-            params[k] = v;
+        // Build server_http_req from httplib_coro::Request (PSR-7 compatible)
+        server_http_req request;
+
+        // PSR-7 core fields
+        request.method = req.method;
+        request.request_target = req.target;
+        request.path = req.path;
+        request.body = req.body;
+
+        // Extract protocol version from "HTTP/1.1" format
+        if (req.version.size() > 5 && req.version.rfind("HTTP/", 0) == 0) {
+            request.protocol_version = req.version.substr(5);
         }
 
-        std::map<std::string, std::string> headers;
+        // Extract query string from target
+        auto query_pos = req.target.find('?');
+        if (query_pos != std::string::npos) {
+            request.query_string = req.target.substr(query_pos + 1);
+        }
+
+        // PSR-7 server request fields
+        request.remote_addr = req.remote_addr;
+        request.remote_port = req.remote_port;
+
+        // Parse host header for host/port
+        std::string host_header = req.get_header_value("Host");
+        if (!host_header.empty()) {
+            auto colon_pos = host_header.find(':');
+            if (colon_pos != std::string::npos) {
+                request.host = host_header.substr(0, colon_pos);
+                try {
+                    request.port = std::stoi(host_header.substr(colon_pos + 1));
+                } catch (...) {
+                    request.port = 0;
+                }
+            } else {
+                request.host = host_header;
+            }
+        }
+
+        // Copy headers with multi-value support (PSR-7)
         for (const auto & [k, v] : req.headers) {
-            headers[k] = v;
+            request.headers[k].push_back(v);
+        }
+
+        // Copy params: path params first, then query params
+        for (size_t i = 0; i < param_names.size() && i + 1 < req.matches.size(); i++) {
+            request.params[param_names[i]] = req.matches[i + 1].str();
+        }
+        for (const auto & [k, v] : req.params) {
+            request.params[k] = v;
         }
 
         auto should_stop_flag = std::make_shared<std::atomic<bool>>(false);
-        auto request = std::make_shared<server_http_req>(server_http_req{
-            params,
-            headers,
-            req.path,
-            req.body,
-            [should_stop_flag, running_ptr]() { return should_stop_flag->load() || !running_ptr->load(); }
-        });
+        request.should_stop = [should_stop_flag, running_ptr]() { return should_stop_flag->load() || !running_ptr->load(); };
+
+        auto request_ptr = std::make_shared<server_http_req>(std::move(request));
 
         server_http_res_ptr response;
         try {
-            response = handler(*request);
+            response = handler(*request_ptr);
         } catch (const std::exception & e) {
             res.status = 500;
             res.set_content(
@@ -510,15 +594,18 @@ void server_http_context::post(const std::string & path, const server_http_conte
             return;
         }
 
-        for (const auto & [k, v] : response->headers) {
-            res.set_header(k.c_str(), v.c_str());
+        // Write multi-value headers (PSR-7)
+        for (const auto & [k, values] : response->headers) {
+            for (const auto & v : values) {
+                res.set_header(k.c_str(), v.c_str());
+            }
         }
 
         if (response->is_stream()) {
             res.status = response->status;
             auto resp_shared = std::shared_ptr<server_http_res>(std::move(response));
             res.set_chunked_content_provider(
-                [resp_shared, request, should_stop_flag](size_t offset, httplib_coro::DataSink & sink) {
+                [resp_shared, request_ptr, should_stop_flag](size_t offset, httplib_coro::DataSink & sink) {
                     if (!sink.is_writable()) {
                         should_stop_flag->store(true);
                         return false;

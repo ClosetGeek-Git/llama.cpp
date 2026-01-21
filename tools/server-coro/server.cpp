@@ -94,6 +94,7 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: failed to initialize HTTP server\n", __func__);
         return 1;
     }
+    ctx_http.set_server_context(&ctx_server);
 
     //
     // Router

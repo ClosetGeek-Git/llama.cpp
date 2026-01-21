@@ -181,7 +181,7 @@ public:
                       const std::string & host,
                       int port,
                       const std::string & path,
-                      const std::map<std::string, std::string> & headers,
+                      const http_headers_t & headers,
                       const std::string & body,
                       const std::function<bool()> should_stop,
                       int32_t timeout_read,
@@ -195,7 +195,7 @@ public:
 private:
     std::thread thread;
     struct msg_t {
-        std::map<std::string, std::string> headers;
+        http_headers_t headers;
         int status = 0;
         std::string data;
         std::string content_type;
