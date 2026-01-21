@@ -1964,6 +1964,73 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SEQ_STATE_GET:
+                {
+                    int id_slot = task.seq_state_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    // Get the exact size needed for this sequence's state
+                    const size_t state_size = llama_state_seq_get_size(ctx, slot->id);
+
+                    auto res = std::make_unique<server_task_result_seq_state_get>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->state_data.resize(state_size);
+
+                    // Copy the sequence state into the buffer
+                    const size_t n_written = llama_state_seq_get_data(ctx, res->state_data.data(), state_size, slot->id);
+                    res->state_data.resize(n_written); // trim to actual written size
+                    res->n_bytes = n_written;
+
+                    const int64_t t_end = ggml_time_us();
+                    res->t_ms = (t_end - t_start) / 1000.0;
+
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SEQ_STATE_SET:
+                {
+                    int id_slot = task.seq_state_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    const std::vector<uint8_t> & state_data = task.seq_state_action.state_data;
+
+                    // Restore the sequence state from the buffer
+                    const size_t n_read = llama_state_seq_set_data(ctx, state_data.data(), state_data.size(), slot->id);
+                    const bool success = (n_read > 0);
+
+                    const int64_t t_end = ggml_time_us();
+
+                    auto res = std::make_unique<server_task_result_seq_state_set>();
+                    res->id           = task.id;
+                    res->id_slot      = id_slot;
+                    res->n_bytes_read = n_read;
+                    res->success      = success;
+                    res->t_ms         = (t_end - t_start) / 1000.0;
+
+                    queue_results.send(std::move(res));
+                } break;
         }
     }
 
@@ -3056,6 +3123,51 @@ llama_context * server_context::get_llama_context() const {
 
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
+}
+
+std::vector<uint8_t> server_context::get_slot_state(int slot_id) {
+    auto reader = impl->get_response_reader();
+
+    server_task task(SERVER_TASK_TYPE_SEQ_STATE_GET);
+    task.id = reader.get_new_id();
+    task.seq_state_action.slot_id = slot_id;
+
+    reader.post_task(std::move(task));
+
+    auto result = reader.next([]() { return false; });
+    if (!result || result->is_error()) {
+        return {};
+    }
+
+    auto * res = dynamic_cast<server_task_result_seq_state_get *>(result.get());
+    if (!res) {
+        return {};
+    }
+
+    return std::move(res->state_data);
+}
+
+size_t server_context::set_slot_state(int slot_id, const std::vector<uint8_t> & state_data) {
+    auto reader = impl->get_response_reader();
+
+    server_task task(SERVER_TASK_TYPE_SEQ_STATE_SET);
+    task.id = reader.get_new_id();
+    task.seq_state_action.slot_id = slot_id;
+    task.seq_state_action.state_data = state_data;
+
+    reader.post_task(std::move(task));
+
+    auto result = reader.next([]() { return false; });
+    if (!result || result->is_error()) {
+        return 0;
+    }
+
+    auto * res = dynamic_cast<server_task_result_seq_state_set *>(result.get());
+    if (!res || !res->success) {
+        return 0;
+    }
+
+    return res->n_bytes_read;
 }
 
 server_context_meta server_context::get_meta() const {

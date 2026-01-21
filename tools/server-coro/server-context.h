@@ -66,6 +66,14 @@ struct server_context {
     // get server metadata (read-only), can only be called after load_model()
     // not thread-safe, should only be used from the main thread
     server_context_meta get_meta() const;
+
+    // Get the KV cache state for a specific slot
+    // Returns the serialized state data, or empty vector on error
+    std::vector<uint8_t> get_slot_state(int slot_id);
+
+    // Set the KV cache state for a specific slot
+    // Returns the number of bytes read from state_data, or 0 on error
+    size_t set_slot_state(int slot_id, const std::vector<uint8_t> & state_data);
 };
 
 

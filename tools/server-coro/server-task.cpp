@@ -1474,6 +1474,31 @@ json server_task_result_apply_lora::to_json() {
 }
 
 //
+// server_task_result_seq_state_get
+//
+
+json server_task_result_seq_state_get::to_json() {
+    return json {
+        { "id_slot",  id_slot },
+        { "n_bytes",  n_bytes },
+        { "t_ms",     t_ms },
+    };
+}
+
+//
+// server_task_result_seq_state_set
+//
+
+json server_task_result_seq_state_set::to_json() {
+    return json {
+        { "id_slot",      id_slot },
+        { "n_bytes_read", n_bytes_read },
+        { "success",      success },
+        { "t_ms",         t_ms },
+    };
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {

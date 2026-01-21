@@ -26,6 +26,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_SEQ_STATE_GET,
+    SERVER_TASK_TYPE_SEQ_STATE_SET,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -143,6 +145,13 @@ struct server_task {
         std::string filepath;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_SEQ_STATE_GET, SERVER_TASK_TYPE_SEQ_STATE_SET
+    struct seq_state_action {
+        int slot_id;
+        std::vector<uint8_t> state_data; // for SET: input data; for GET: unused
+    };
+    seq_state_action seq_state_action;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -532,6 +541,22 @@ struct server_task_result_get_lora : server_task_result {
 };
 
 struct server_task_result_apply_lora : server_task_result {
+    virtual json to_json() override;
+};
+
+struct server_task_result_seq_state_get : server_task_result {
+    std::vector<uint8_t> state_data;
+    size_t n_bytes;
+    double t_ms;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_seq_state_set : server_task_result {
+    size_t n_bytes_read;
+    bool success;
+    double t_ms;
+
     virtual json to_json() override;
 };
 
