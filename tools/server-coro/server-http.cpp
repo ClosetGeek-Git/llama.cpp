@@ -128,6 +128,7 @@ server_http_context::server_http_context()
 
 server_http_context::~server_http_context() = default;
 
+// coro compatible
 std::vector<uint8_t> server_http_context::get_slot_state(int slot_id) {
     if (!ctx_server) {
         return {};
@@ -135,6 +136,7 @@ std::vector<uint8_t> server_http_context::get_slot_state(int slot_id) {
     return ctx_server->get_slot_state(slot_id);
 }
 
+// coro compatible
 size_t server_http_context::set_slot_state(int slot_id, const std::vector<uint8_t> & state_data) {
     if (!ctx_server) {
         return 0;
