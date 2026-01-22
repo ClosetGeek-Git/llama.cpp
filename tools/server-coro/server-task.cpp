@@ -583,6 +583,7 @@ json server_task_result_cmpl_final::to_json() {
         case TASK_RESPONSE_TYPE_OAI_CMPL:
             return to_json_oaicompat();
         case TASK_RESPONSE_TYPE_OAI_CHAT:
+        case TASK_RESPONSE_TYPE_RAW:
             return stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat();
         case TASK_RESPONSE_TYPE_ANTHROPIC:
             return stream ? to_json_anthropic_stream() : to_json_anthropic();
@@ -1065,6 +1066,7 @@ json server_task_result_cmpl_partial::to_json() {
         case TASK_RESPONSE_TYPE_OAI_CMPL:
             return to_json_oaicompat();
         case TASK_RESPONSE_TYPE_OAI_CHAT:
+        case TASK_RESPONSE_TYPE_RAW:
             return to_json_oaicompat_chat();
         case TASK_RESPONSE_TYPE_ANTHROPIC:
             return to_json_anthropic();

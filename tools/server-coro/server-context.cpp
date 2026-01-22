@@ -589,6 +589,15 @@ private:
 
     bool sleeping = false;
 
+    // Test stream state for no-op streaming tests (exercises full code path without model)
+    struct test_stream_state {
+        int id_task;
+        int n_chunks;
+        int chunks_sent;
+        bool is_streaming;
+    };
+    std::vector<test_stream_state> active_test_streams;
+
     void destroy() {
         llama_init.reset();
         ctx = nullptr;
@@ -2031,10 +2040,70 @@ private:
 
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_TEST_STREAM:
+                {
+                    // No-op streaming test - sends synthetic chunks without model inference
+                    // Useful for testing PHP extension code path under valgrind
+                    const int n_chunks = task.params.n_predict > 0 ? task.params.n_predict : 10;
+                    const bool is_streaming = task.params.stream;
+
+                    if (is_streaming) {
+                        // Register this test stream to be processed in update_slots()
+                        // This simulates real streaming where chunks come across multiple loop iterations
+                        active_test_streams.push_back({
+                            task.id,
+                            n_chunks,
+                            0,  // chunks_sent
+                            true
+                        });
+                        SRV_DBG("test stream started, id_task = %d, n_chunks = %d\n", task.id, n_chunks);
+                    } else {
+                        // Non-streaming: send final result immediately
+                        std::string full_content;
+                        for (int i = 0; i < n_chunks; i++) {
+                            full_content += "chunk_" + std::to_string(i) + " ";
+                        }
+                        auto res = std::make_unique<server_task_result_test_stream_final>();
+                        res->id = task.id;
+                        res->total_chunks = n_chunks;
+                        res->full_content = full_content;
+                        queue_results.send(std::move(res));
+                    }
+                } break;
         }
     }
 
     void update_slots() {
+        // Process active test streams (no-op streaming for testing)
+        // Each iteration sends one chunk, simulating real token generation
+        for (auto it = active_test_streams.begin(); it != active_test_streams.end(); ) {
+            auto & ts = *it;
+            if (ts.chunks_sent < ts.n_chunks) {
+                // Send one partial result per iteration
+                auto res = std::make_unique<server_task_result_test_stream_partial>();
+                res->id = ts.id_task;
+                res->chunk_index = ts.chunks_sent;
+                res->total_chunks = ts.n_chunks;
+                res->content = "chunk_" + std::to_string(ts.chunks_sent) + " ";
+                queue_results.send(std::move(res));
+                ts.chunks_sent++;
+                ++it;
+            } else {
+                // All chunks sent, send final result and remove
+                std::string full_content;
+                for (int i = 0; i < ts.n_chunks; i++) {
+                    full_content += "chunk_" + std::to_string(i) + " ";
+                }
+                auto res = std::make_unique<server_task_result_test_stream_final>();
+                res->id = ts.id_task;
+                res->total_chunks = ts.n_chunks;
+                res->full_content = full_content;
+                queue_results.send(std::move(res));
+                SRV_DBG("test stream completed, id_task = %d\n", ts.id_task);
+                it = active_test_streams.erase(it);
+            }
+        }
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2046,7 +2115,7 @@ private:
                 }
             }
 
-            if (all_idle) {
+            if (all_idle && active_test_streams.empty()) {
                 SRV_INF("%s", "all slots are idle\n");
 
                 return;
@@ -3361,6 +3430,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         json first_result_json = first_result->to_json();
         if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
             res->data = format_anthropic_sse(first_result_json);
+        } else if (res_type == TASK_RESPONSE_TYPE_RAW) {
+            // RAW format: iterate array and output each element on a line
+            if (first_result_json.is_array()) {
+                std::string combined;
+                for (const auto & elem : first_result_json) {
+                    combined += elem.dump() + "\n";
+                }
+                res->data = combined;
+            } else {
+                res->data = first_result_json.dump() + "\n";
+            }
         } else {
             res->data = format_oai_sse(first_result_json);
         }
@@ -3373,6 +3453,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         {"event", "error"},
                         {"data", res_json},
                     });
+                } else if (res_type == TASK_RESPONSE_TYPE_RAW) {
+                    return json{{ "error", res_json }}.dump() + "\n";
                 } else {
                     return format_oai_sse(json {{ "error", res_json }});
                 }
@@ -3397,6 +3479,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 if (!rd.has_next()) {
                     if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         // Anthropic doesn't send [DONE], message_stop was already sent
+                        output = "";
+                    } else if (res_type == TASK_RESPONSE_TYPE_RAW) {
+                        // RAW type doesn't send [DONE]
                         output = "";
                     } else if (res_type != TASK_RESPONSE_TYPE_NONE) {
                         output = "data: [DONE]\n\n";
@@ -3429,6 +3514,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     json res_json = result->to_json();
                     if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
+                    } else if (res_type == TASK_RESPONSE_TYPE_RAW) {
+                        // RAW format: iterate array and output each element on a line
+                        if (res_json.is_array()) {
+                            std::string combined;
+                            for (const auto & elem : res_json) {
+                                combined += elem.dump() + "\n";
+                            }
+                            output = combined;
+                        } else {
+                            output = res_json.dump() + "\n";
+                        }
                     } else {
                         output = format_oai_sse(res_json);
                     }
@@ -3454,12 +3550,118 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
 }
 
+// Helper: split path into parts
+static std::vector<std::string> split_path(const std::string & p) {
+    std::vector<std::string> out;
+    size_t i = 0, n = p.size();
+    while (i < n) {
+        while (i < n && p[i] == '/') ++i;
+        if (i >= n) break;
+        size_t j = i;
+        while (j < n && p[j] != '/') ++j;
+        out.emplace_back(p.substr(i, j - i));
+        i = j;
+    }
+    return out;
+}
+
+// Helper: match route template against path, extracting params
+static bool match_route(const route_entry & r, const std::string & path,
+                        std::map<std::string, std::string> & out_params,
+                        const std::string & prefix) {
+    // Apply API prefix if any
+    std::string p = path;
+    if (!prefix.empty()) {
+        if (p.rfind(prefix, 0) == 0) {
+            p = p.substr(prefix.size());
+            if (p.empty()) p = "/";
+        }
+        // If prefix doesn't match, try without prefix (for direct calls)
+    }
+    auto path_parts = split_path(p);
+    if (path_parts.size() != r.parts.size()) return false;
+
+    for (size_t i = 0; i < r.parts.size(); ++i) {
+        const auto & a = r.parts[i];
+        const auto & b = path_parts[i];
+        if (!a.empty() && a[0] == ':') {
+            out_params[a.substr(1)] = b;
+        } else if (a != b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void server_routes::register_route(const std::string & method, const std::string & path,
+                                   server_http_context::handler_t * handler) {
+    route_entry entry;
+    entry.method = method;
+    entry.tmpl = path;
+    entry.parts = split_path(path);
+    entry.handler = handler;
+    routes.push_back(std::move(entry));
+}
+
+const server_http_context::handler_t * server_routes::find_handler(
+        const std::string & method,
+        const std::string & path,
+        std::map<std::string, std::string> & out_params) const {
+    for (const auto & r : routes) {
+        if (r.method != method) continue;
+        out_params.clear();
+        if (match_route(r, path, out_params, api_prefix)) {
+            return r.handler;
+        }
+    }
+    return nullptr;
+}
+
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
         : params(params),
           ctx_server(*ctx_server.impl),
           queue_tasks(ctx_server.impl->queue_tasks),
-          queue_results(ctx_server.impl->queue_results) {
+          queue_results(ctx_server.impl->queue_results),
+          api_prefix(params.api_prefix) {
     init_routes();
+
+    // Register all routes for find_handler() lookup
+    // GET routes
+    register_route("GET", "/health", &get_health);
+    register_route("GET", "/v1/health", &get_health);
+    register_route("GET", "/metrics", &get_metrics);
+    register_route("GET", "/props", &get_props);
+    register_route("GET", "/models", &get_models);
+    register_route("GET", "/v1/models", &get_models);
+    register_route("GET", "/api/tags", &get_models);
+    register_route("GET", "/lora-adapters", &get_lora_adapters);
+    register_route("GET", "/slots", &get_slots);
+
+    // POST routes
+    register_route("POST", "/props", &post_props);
+    register_route("POST", "/api/show", &get_api_show);
+    register_route("POST", "/completion", &post_completions);
+    register_route("POST", "/completions", &post_completions);
+    register_route("POST", "/v1/completions", &post_completions_oai);
+    register_route("POST", "/chat/completions", &post_chat_completions);
+    register_route("POST", "/v1/chat/completions", &post_chat_completions);
+    register_route("POST", "/api/chat", &post_chat_completions);
+    register_route("POST", "/v1/messages", &post_anthropic_messages);
+    register_route("POST", "/v1/messages/count_tokens", &post_anthropic_count_tokens);
+    register_route("POST", "/infill", &post_infill);
+    register_route("POST", "/embedding", &post_embeddings);
+    register_route("POST", "/embeddings", &post_embeddings);
+    register_route("POST", "/v1/embeddings", &post_embeddings_oai);
+    register_route("POST", "/rerank", &post_rerank);
+    register_route("POST", "/reranking", &post_rerank);
+    register_route("POST", "/v1/rerank", &post_rerank);
+    register_route("POST", "/v1/reranking", &post_rerank);
+    register_route("POST", "/tokenize", &post_tokenize);
+    register_route("POST", "/detokenize", &post_detokenize);
+    register_route("POST", "/apply-template", &post_apply_template);
+    register_route("POST", "/lora-adapters", &post_lora_adapters);
+    register_route("POST", "/slots/:id_slot", &post_slots);
+    register_route("POST", "/test/stream", &post_test_stream);
 }
 
 void server_routes::init_routes() {
@@ -3851,12 +4053,17 @@ void server_routes::init_routes() {
             body,
             ctx_server.oai_parser_opt,
             files);
+        // Check for raw response format (e.g., from PHP extension)
+        task_response_type res_type = TASK_RESPONSE_TYPE_OAI_CHAT;
+        if (req.get_header("X-Response-Type") == "raw") {
+            res_type = TASK_RESPONSE_TYPE_RAW;
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_OAI_CHAT);
+            res_type);
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
@@ -4159,6 +4366,85 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_test_stream = [this](const server_http_req & req) {
+        auto res = create_response();
+        json body = json::object();
+        if (!req.body.empty()) {
+            body = json::parse(req.body);
+        }
+
+        // Get n_chunks from request body, default to 10
+        int n_chunks = 10;
+        if (body.contains("n_chunks") && body["n_chunks"].is_number_integer()) {
+            n_chunks = body["n_chunks"].get<int>();
+        }
+
+        // Get stream flag from request body, default to true
+        bool is_streaming = true;
+        if (body.contains("stream") && body["stream"].is_boolean()) {
+            is_streaming = body["stream"].get<bool>();
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_TEST_STREAM);
+            task.id = rd.get_new_id();
+            task.params.n_predict = n_chunks;
+            task.params.stream = is_streaming;
+            rd.post_task(std::move(task));
+        }
+
+        if (is_streaming) {
+            // Set up streaming response - same pattern as completions
+            res->status = 200;
+            res->content_type = "text/event-stream";
+            res->next = [res_this = res.get(), &req](std::string & output) -> bool {
+                if (req.should_stop()) {
+                    return false;
+                }
+
+                server_response_reader & rd = res_this->rd;
+
+                if (!rd.has_next()) {
+                    output = "";
+                    return false; // no more data
+                }
+
+                auto result = rd.next(req.should_stop);
+                if (result == nullptr) {
+                    return false; // should_stop condition met
+                }
+
+                if (result->is_error()) {
+                    output = json{{"error", result->to_json()}}.dump() + "\n";
+                    return false;
+                }
+
+                if (result->is_stop()) {
+                    output = "";
+                    return false; // end of stream
+                }
+
+                output = result->to_json().dump() + "\n";
+                return true;
+            };
+        } else {
+            // Non-streaming: wait for final result
+            auto result = rd.next(req.should_stop);
+            if (!result) {
+                GGML_ASSERT(req.should_stop());
+                return res;
+            }
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+            res->ok(result->to_json());
+        }
+
         return res;
     };
 }

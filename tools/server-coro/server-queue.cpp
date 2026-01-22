@@ -375,6 +375,10 @@ void server_response::send(server_task_result_ptr && result) {
 
 void server_response::terminate() {
     RES_DBG("%s", "terminating response queue\n");
+    
+    // Set shutdown flag BEFORE modifying state - readers check this to avoid use-after-free
+    shutdown_flag->store(true);
+    
     running = false;
     condition_results.notify_all();
 
@@ -549,6 +553,12 @@ server_response_reader::batch_response server_response_reader::wait_for_all(cons
 }
 
 void server_response_reader::stop() {
+    // Guard against calling stop() after server_response has been destroyed
+    // This can happen if Request objects are GC'd after swoole_llama_shutdown()
+    if (shutdown_flag->load()) {
+        return;
+    }
+
     // Unregister eventfd for all tasks
     if (event_fd >= 0) {
         for (const auto & id_task : id_tasks) {

@@ -28,6 +28,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_SEQ_STATE_GET,
     SERVER_TASK_TYPE_SEQ_STATE_SET,
+    SERVER_TASK_TYPE_TEST_STREAM,  // no-op streaming for testing PHP extension
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -37,6 +38,7 @@ enum task_response_type {
     TASK_RESPONSE_TYPE_OAI_CMPL,
     TASK_RESPONSE_TYPE_OAI_EMBD,
     TASK_RESPONSE_TYPE_ANTHROPIC,
+    TASK_RESPONSE_TYPE_RAW,  // Raw JSON, no SSE wrapper (for PHP extension)
 };
 
 enum stop_type {
@@ -558,6 +560,37 @@ struct server_task_result_seq_state_set : server_task_result {
     double t_ms;
 
     virtual json to_json() override;
+};
+
+// Test stream results - for testing PHP extension without model inference
+struct server_task_result_test_stream_partial : server_task_result {
+    int chunk_index;
+    int total_chunks;
+    std::string content;
+
+    virtual bool is_stop() override { return false; }
+    virtual json to_json() override {
+        return json{
+            {"chunk_index", chunk_index},
+            {"total_chunks", total_chunks},
+            {"content", content},
+            {"stop", false}
+        };
+    }
+};
+
+struct server_task_result_test_stream_final : server_task_result {
+    int total_chunks;
+    std::string full_content;
+
+    virtual bool is_stop() override { return true; }
+    virtual json to_json() override {
+        return json{
+            {"total_chunks", total_chunks},
+            {"content", full_content},
+            {"stop", true}
+        };
+    }
 };
 
 struct server_prompt_checkpoint {

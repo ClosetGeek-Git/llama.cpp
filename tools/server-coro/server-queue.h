@@ -2,8 +2,10 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include <unordered_set>
@@ -116,6 +118,9 @@ struct server_response {
 private:
     bool running = true;
 
+    // Shared shutdown flag - readers hold this to detect when queue is destroyed
+    std::shared_ptr<std::atomic<bool>> shutdown_flag = std::make_shared<std::atomic<bool>>(false);
+
     // for keeping track of all tasks waiting for the result
     std::unordered_set<int> waiting_task_ids;
 
@@ -167,6 +172,11 @@ public:
     bool is_running() const {
         return running;
     }
+
+    // Get shared shutdown flag for readers to detect when queue is destroyed
+    std::shared_ptr<std::atomic<bool>> get_shutdown_flag() const {
+        return shutdown_flag;
+    }
 };
 
 // utility class to make working with server_queue and server_response easier
@@ -180,6 +190,9 @@ struct server_response_reader {
     bool cancelled = false;
     int polling_interval_seconds;
 
+    // Holds shared shutdown flag to detect when queue is destroyed (avoids use-after-free in stop())
+    std::shared_ptr<std::atomic<bool>> shutdown_flag;
+
     // eventfd for coroutine-yielding wait (signaled by decode thread when results ready)
     int event_fd = -1;
 
@@ -190,7 +203,8 @@ struct server_response_reader {
     // should_stop function will be called each polling_interval_seconds
     // TODO: timeout support via poll() on event_fd needs to be implemented
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
-        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {
+        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds),
+          shutdown_flag(queue_results.get_shutdown_flag()) {
         event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (event_fd < 0) {
             LOG_WRN("eventfd creation failed, falling back to polling mode: %s\n", strerror(errno));

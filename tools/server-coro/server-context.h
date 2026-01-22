@@ -1,3 +1,5 @@
+#pragma once
+
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -8,6 +10,14 @@
 #include <memory>
 
 struct server_context_impl; // private implementation
+
+// Route entry for find_handler() lookup
+struct route_entry {
+    std::string method;                           // "GET" or "POST"
+    std::string tmpl;                             // e.g. "/slots/:id_slot"
+    std::vector<std::string> parts;               // split template parts
+    server_http_context::handler_t * handler;     // pointer to handler member
+};
 
 struct server_context_meta {
     std::string build_info;
@@ -90,6 +100,17 @@ struct server_routes {
         this->meta = std::make_unique<server_context_meta>(ctx_server.get_meta());
     }
 
+    // Find handler by method and path, extracting path parameters
+    // Returns pointer to handler, or nullptr if not found
+    // Populates out_params with extracted path parameters (e.g., id_slot from /slots/:id_slot)
+    const server_http_context::handler_t * find_handler(
+        const std::string & method,
+        const std::string & path,
+        std::map<std::string, std::string> & out_params) const;
+
+    // Get API prefix for path matching
+    const std::string & get_api_prefix() const { return api_prefix; }
+
     // handlers using lambda function, so that they can capture `this` without `std::bind`
     // they won't be called until ctx_http.is_ready is set to true
     server_http_context::handler_t get_health;
@@ -114,7 +135,14 @@ struct server_routes {
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t post_test_stream;  // no-op streaming for testing
 private:
+    // Route registry for find_handler()
+    std::vector<route_entry> routes;
+    std::string api_prefix;
+
+    void register_route(const std::string & method, const std::string & path, server_http_context::handler_t * handler);
+
     std::unique_ptr<server_res_generator> handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
