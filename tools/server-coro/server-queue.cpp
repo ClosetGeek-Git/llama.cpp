@@ -7,8 +7,11 @@
 #include "swoole.h"
 #include "swoole_coroutine_api.h"
 
+#include <atomic>
 #include <chrono>
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -19,6 +22,23 @@
 #define RES_WRN(fmt, ...) LOG_WRN("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define RES_ERR(fmt, ...) LOG_ERR("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define RES_DBG(fmt, ...) LOG_DBG("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+
+// Coroutine debug logging - enabled by LLAMA_CORO_DEBUG_JSON env var
+// Using atomic for thread-safe initialization
+static std::atomic<int> g_coro_debug_enabled{-1};
+
+static bool coro_debug_enabled() {
+    int val = g_coro_debug_enabled.load(std::memory_order_acquire);
+    if (val < 0) {
+        const char* env = getenv("LLAMA_CORO_DEBUG_JSON");
+        val = (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0)) ? 1 : 0;
+        g_coro_debug_enabled.store(val, std::memory_order_release);
+    }
+    return val == 1;
+}
+
+#define CORO_DBG(fmt, ...) \
+    do { if (coro_debug_enabled()) { fprintf(stderr, "[CORO_DBG] %s: " fmt "\n", __func__, ##__VA_ARGS__); fflush(stderr); } } while(0)
 
 //
 // server_queue
@@ -130,6 +150,7 @@ void server_queue::terminate() {
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     running = true;
     time_last_task = ggml_time_ms();
+    CORO_DBG("start_loop ENTER: idle_sleep_ms=%ld", (long)idle_sleep_ms);
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {
@@ -147,6 +168,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running) {
+                CORO_DBG("start_loop: terminating");
                 QUE_DBG("%s", "terminate\n");
                 return;
             }
@@ -158,20 +180,25 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             queue_tasks.pop_front();
             lock.unlock();
 
+            CORO_DBG("start_loop: processing task id=%d type=%d", task.id, (int)task.type);
             QUE_DBG("processing task, id = %d\n", task.id);
             callback_new_task(std::move(task));
+            CORO_DBG("start_loop: task id=%d processed", task.id);
         }
         // all tasks in the current loop is processed, slots data is now ready
+        CORO_DBG("start_loop: calling update_slots");
         QUE_DBG("%s", "update slots\n");
 
         // this will run the main inference process for all slots
         callback_update_slots();
+        CORO_DBG("start_loop: update_slots returned");
         {
             // update_slots() may take a while to finish, we need to make sure it's not counted as idle
             std::unique_lock<std::mutex> lock(mutex_tasks);
             time_last_task = ggml_time_ms();
         }
 
+        CORO_DBG("start_loop: waiting for new tasks");
         QUE_DBG("%s", "waiting for new tasks\n");
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -341,19 +368,27 @@ server_task_result_ptr server_response::recv(int id_task) {
 
 void server_response::send(server_task_result_ptr && result) {
     RES_DBG("sending result for task id = %d\n", result->id);
+    CORO_DBG("ENTER: result id=%d is_stop=%d is_error=%d", result->id, result->is_stop(), result->is_error());
 
     int result_id = result->id;
 
     {
         std::unique_lock<std::mutex> lock(mutex_results);
+        CORO_DBG("checking waiting_task_ids, size=%zu", waiting_task_ids.size());
+        bool found = false;
         for (const auto & id_task : waiting_task_ids) {
             if (result_id == id_task) {
                 RES_DBG("task id = %d pushed to result queue\n", result_id);
+                CORO_DBG("task id=%d matched waiting task, pushing to queue", result_id);
 
                 queue_results.emplace_back(std::move(result));
                 condition_results.notify_all();
+                found = true;
                 break;
             }
+        }
+        if (!found) {
+            CORO_DBG("task id=%d NOT found in waiting_task_ids!", result_id);
         }
     }
 
@@ -362,13 +397,17 @@ void server_response::send(server_task_result_ptr && result) {
         std::unique_lock<std::mutex> lock(mutex_eventfd);
         auto it = task_to_eventfd.find(result_id);
         if (it != task_to_eventfd.end()) {
+            CORO_DBG("signaling eventfd %d for task %d", it->second, result_id);
             uint64_t val = 1;
             ssize_t r = write(it->second, &val, sizeof(val));
             if (r < 0) {
                 RES_WRN("failed to signal eventfd for task %d: %s\n", result_id, strerror(errno));
             } else {
                 RES_DBG("signaled eventfd for task %d\n", result_id);
+                CORO_DBG("eventfd signal write successful for task %d", result_id);
             }
+        } else {
+            CORO_DBG("NO eventfd registered for task %d (map size=%zu)", result_id, task_to_eventfd.size());
         }
     }
 }
@@ -402,6 +441,10 @@ void server_response::terminate() {
 void server_response_reader::post_task(server_task && task, bool front) {
     GGML_ASSERT(id_tasks.empty() && "post_task() can only be called once per reader");
     GGML_ASSERT(!task.is_parent() && "not supported, use post_tasks() instead");
+    
+    int task_id = task.id;
+    CORO_DBG("ENTER: task_id=%d front=%d event_fd=%d", task_id, front, event_fd);
+    
     task.index = 0;
     id_tasks.insert(task.id);
     states.push_back(task.create_state());
@@ -410,15 +453,21 @@ void server_response_reader::post_task(server_task && task, bool front) {
     if (event_fd >= 0) {
         queue_results.register_eventfd(task.id, event_fd);
     }
+    CORO_DBG("task_id=%d: posting to queue...", task_id);
     queue_tasks.post(std::move(task), front);
 
     // Yield to let other coroutines post their tasks before we wait for results
     // This enables batching of concurrent requests
+    CORO_DBG("task_id=%d: yielding coroutine (swoole_coroutine_usleep)...", task_id);
     swoole_coroutine_usleep(1);
+    CORO_DBG("task_id=%d: EXIT after yield", task_id);
 }
 
 void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool front) {
     GGML_ASSERT(id_tasks.empty() && "post_tasks() can only be called once per reader");
+    
+    CORO_DBG("ENTER: num_tasks=%zu front=%d event_fd=%d", tasks.size(), front, event_fd);
+    
     id_tasks = server_task::get_list_id(tasks);
     states.reserve(tasks.size());
     size_t index = 0;
@@ -439,11 +488,14 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool 
             queue_results.register_eventfd(id_task, event_fd);
         }
     }
+    CORO_DBG("posting %zu tasks to queue...", tasks.size());
     queue_tasks.post(std::move(tasks), front);
 
     // Yield to let other coroutines post their tasks before we wait for results
     // This enables batching of concurrent requests
+    CORO_DBG("yielding coroutine (swoole_coroutine_usleep)...");
     swoole_coroutine_usleep(1);
+    CORO_DBG("EXIT after yield");
 }
 
 bool server_response_reader::has_next() const {
@@ -453,19 +505,29 @@ bool server_response_reader::has_next() const {
 // return nullptr if should_stop() is true before receiving a result
 // note: if one error is received, it will stop further processing and return error result
 server_task_result_ptr server_response_reader::next(const std::function<bool()> & should_stop) {
+    CORO_DBG("ENTER: num_id_tasks=%zu event_fd=%d", id_tasks.size(), event_fd);
+    int loop_count = 0;
+    
     while (true) {
+        loop_count++;
+        
         // Check if the queue is shutting down
         if (!queue_results.is_running()) {
+            CORO_DBG("EXIT: queue is shutting down");
             SRV_DBG("%s", "queue is shutting down, returning nullptr\n");
             return nullptr;
         }
 
         // Try non-blocking fetch first
+        CORO_DBG("loop=%d: trying recv_with_timeout (non-blocking)...", loop_count);
         server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, 0);
         
         if (result == nullptr) {
+            CORO_DBG("loop=%d: no result yet", loop_count);
+            
             // No result yet, check stop condition
             if (should_stop()) {
+                CORO_DBG("EXIT: should_stop returned true");
                 SRV_DBG("%s", "stopping wait for next result due to should_stop condition\n");
                 return nullptr;
             }
@@ -479,10 +541,13 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                         // No data available - yield coroutine until eventfd becomes readable
                         // swoole_coroutine_socket_wait_event will suspend this coroutine
                         // and resume it when the eventfd is signaled (written to)
+                        CORO_DBG("loop=%d: yielding coroutine (swoole_coroutine_socket_wait_event)...", loop_count);
                         int wait_result = swoole_coroutine_socket_wait_event(event_fd, SW_EVENT_READ, -1);
+                        CORO_DBG("loop=%d: coroutine resumed, wait_result=%d", loop_count, wait_result);
                         if (wait_result < 0) {
                             // Wait failed - could be interrupted or fd closed
                             if (!queue_results.is_running()) {
+                                CORO_DBG("EXIT: queue stopped during eventfd wait");
                                 SRV_DBG("%s", "queue stopped during eventfd wait\n");
                                 return nullptr;
                             }
@@ -493,14 +558,18 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                     } else {
                         SRV_WRN("eventfd read error: %s\n", strerror(errno));
                     }
+                } else {
+                    CORO_DBG("loop=%d: eventfd had data, val=%lu", loop_count, (unsigned long)val);
                 }
                 // After waking, check if queue is still running
                 if (!queue_results.is_running()) {
+                    CORO_DBG("EXIT: queue stopped while waiting on eventfd");
                     SRV_DBG("%s", "queue stopped while waiting on eventfd\n");
                     return nullptr;
                 }
             } else {
                 // Fallback: use polling with condition_variable timeout
+                CORO_DBG("loop=%d: no eventfd, using polling fallback", loop_count);
                 result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
                 if (result == nullptr) {
                     continue; // timeout, loop to check should_stop
@@ -509,8 +578,14 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
         }
         
         if (result != nullptr) {
-            if (result->is_error()) {
+            int result_id = result->id;
+            bool is_error = result->is_error();
+            bool is_stop = result->is_stop();
+            CORO_DBG("loop=%d: got result id=%d is_error=%d is_stop=%d", loop_count, result_id, is_error, is_stop);
+            
+            if (is_error) {
                 stop(); // cancel remaining tasks
+                CORO_DBG("EXIT: error result");
                 SRV_DBG("%s", "received error result, stopping further processing\n");
                 return result;
             }
@@ -520,8 +595,11 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                 GGML_ASSERT(idx < states.size());
                 result->update(states[idx]);
             }
-            if (result->is_stop()) {
+            if (is_stop) {
                 received_count++;
+                CORO_DBG("EXIT: stop result, received_count=%zu", received_count);
+            } else {
+                CORO_DBG("EXIT: returning streaming chunk");
             }
             return result;
         }

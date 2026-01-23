@@ -53,6 +53,7 @@ struct LlamaRequestObject {
     server_http_res_ptr response;
     std::shared_ptr<std::atomic<bool>> cancelled;
     bool is_stream;
+    int request_id;  // Debug tracking ID
     zend_object std;
 };
 

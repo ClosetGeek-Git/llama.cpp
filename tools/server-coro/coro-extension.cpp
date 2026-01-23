@@ -14,8 +14,25 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <cstdlib>
 
 using json = nlohmann::ordered_json;
+
+// Debug logging for PHP extension - enabled by LLAMA_PHP_DEBUG_JSON env var
+static bool php_debug_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("LLAMA_PHP_DEBUG_JSON");
+        enabled = (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0)) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+#define PHP_DBG(req_id, fmt, ...) \
+    do { if (php_debug_enabled()) { fprintf(stderr, "[PHP_DBG req=%d] %s: " fmt "\n", req_id, __func__, ##__VA_ARGS__); fflush(stderr); } } while(0)
+
+// Request ID counter for tracking
+static std::atomic<int> g_request_id_counter{0};
 
 // Global state (equivalent to server.cpp locals)
 static common_params *g_params = nullptr;
@@ -49,6 +66,7 @@ static zend_object *llama_request_create_object(zend_class_entry *ce)
     intern->response = nullptr;
     intern->cancelled = std::make_shared<std::atomic<bool>>(false);
     intern->is_stream = false;
+    intern->request_id = -1;  // Will be assigned in __construct
 
     zend_object_std_init(&intern->std, ce);
     object_properties_init(&intern->std, ce);
@@ -407,34 +425,45 @@ static bool php_array_to_request(zval *z_request, server_http_req &req, std::sha
 static PHP_METHOD(LlamaRequest, __construct)
 {
     zval *z_params;
+    int req_id = g_request_id_counter.fetch_add(1);
+
+    PHP_DBG(req_id, "ENTER");
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_ARRAY(z_params)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_routes) {
+        PHP_DBG(req_id, "ERROR: llama context not initialized");
         zend_throw_exception(zend_ce_exception, "llama context not initialized", 0);
         RETURN_THROWS();
     }
 
     LlamaRequestObject *intern = Z_LLAMA_REQUEST_P(ZEND_THIS);
+    intern->request_id = req_id;
 
     // Convert PHP array to request
+    PHP_DBG(req_id, "parsing request array...");
     if (!php_array_to_request(z_params, intern->request, intern->cancelled)) {
+        PHP_DBG(req_id, "ERROR: Invalid request format");
         zend_throw_exception(zend_ce_exception, "Invalid request format", 0);
         RETURN_THROWS();
     }
+    PHP_DBG(req_id, "parsed: method=%s path=%s body_len=%zu", 
+            intern->request.method.c_str(), intern->request.path.c_str(), intern->request.body.size());
 
     // Find handler using path matching
     std::map<std::string, std::string> path_params;
-    const server_http_context::handler_t *handler = g_routes->find_handler(
-        intern->request.method, intern->request.path, path_params);
+    PHP_DBG(req_id, "finding handler...");
+    const server_http_context::handler_t *handler = g_routes->find_handler(intern->request.method, intern->request.path, path_params);
 
     if (!handler) {
+        PHP_DBG(req_id, "ERROR: No handler found");
         zend_throw_exception_ex(zend_ce_exception, 0,
             "No handler for %s %s", intern->request.method.c_str(), intern->request.path.c_str());
         RETURN_THROWS();
     }
+    PHP_DBG(req_id, "handler found, path_params=%zu", path_params.size());
 
     // Merge path params into request params (path params take precedence)
     for (const auto &[k, v] : path_params) {
@@ -442,19 +471,24 @@ static PHP_METHOD(LlamaRequest, __construct)
     }
 
     // Invoke handler with the persistent request reference
+    PHP_DBG(req_id, "invoking handler...");
     try {
         intern->response = (*handler)(intern->request);
     } catch (const std::exception &e) {
+        PHP_DBG(req_id, "ERROR: handler threw exception: %s", e.what());
         zend_throw_exception_ex(zend_ce_exception, 0, "Handler error: %s", e.what());
         RETURN_THROWS();
     }
+    PHP_DBG(req_id, "handler returned");
 
     if (!intern->response) {
+        PHP_DBG(req_id, "ERROR: handler returned null response");
         zend_throw_exception(zend_ce_exception, "Handler returned null response", 0);
         RETURN_THROWS();
     }
 
     intern->is_stream = intern->response->is_stream();
+    PHP_DBG(req_id, "EXIT: is_stream=%d response_data_len=%zu", intern->is_stream, intern->response->data.size());
 }
 
 // Llama\Request::isStream(): bool
@@ -463,6 +497,7 @@ static PHP_METHOD(LlamaRequest, isStream)
     ZEND_PARSE_PARAMETERS_NONE();
 
     LlamaRequestObject *intern = Z_LLAMA_REQUEST_P(ZEND_THIS);
+    PHP_DBG(intern->request_id, "is_stream=%d", intern->is_stream);
     RETURN_BOOL(intern->is_stream);
 }
 
@@ -472,8 +507,10 @@ static PHP_METHOD(LlamaRequest, getData)
     ZEND_PARSE_PARAMETERS_NONE();
 
     LlamaRequestObject *intern = Z_LLAMA_REQUEST_P(ZEND_THIS);
+    PHP_DBG(intern->request_id, "ENTER: is_stream=%d", intern->is_stream);
 
     if (!intern->response) {
+        PHP_DBG(intern->request_id, "EXIT: no response, returning null");
         RETURN_NULL();
     }
 
@@ -482,11 +519,14 @@ static PHP_METHOD(LlamaRequest, getData)
         if (!intern->response->data.empty()) {
             std::string first_chunk = std::move(intern->response->data);
             intern->response->data.clear();
+            PHP_DBG(intern->request_id, "EXIT (stream): returning first chunk, len=%zu", first_chunk.length());
             RETURN_STRINGL(first_chunk.c_str(), first_chunk.length());
         }
+        PHP_DBG(intern->request_id, "EXIT (stream): no data, returning null");
         RETURN_NULL();
     } else {
         // For non-streaming: return response->data
+        PHP_DBG(intern->request_id, "EXIT (non-stream): returning data, len=%zu", intern->response->data.length());
         RETURN_STRINGL(intern->response->data.c_str(), intern->response->data.length());
     }
 }
@@ -497,25 +537,31 @@ static PHP_METHOD(LlamaRequest, next)
     ZEND_PARSE_PARAMETERS_NONE();
 
     LlamaRequestObject *intern = Z_LLAMA_REQUEST_P(ZEND_THIS);
+    PHP_DBG(intern->request_id, "ENTER: is_stream=%d", intern->is_stream);
 
     if (!intern->response || !intern->is_stream) {
+        PHP_DBG(intern->request_id, "EXIT: not streaming, returning null");
         RETURN_NULL();
     }
 
     std::string chunk;
 
     // Loop until we get actual content or stream ends
+    PHP_DBG(intern->request_id, "calling response->next()...");
     while (true) {
         bool has_more = intern->response->next(chunk);
 
         if (!has_more) {
+            PHP_DBG(intern->request_id, "EXIT: has_more=false, stream ended");
             RETURN_NULL();
         }
 
         if (!chunk.empty()) {
+            PHP_DBG(intern->request_id, "got chunk, len=%zu", chunk.size());
             break;
         }
         // Empty chunk but has_more=true means flush/continue, keep looping
+        PHP_DBG(intern->request_id, "empty chunk, continuing loop...");
     }
 
     // Parse JSON and return as array
@@ -565,10 +611,12 @@ static PHP_METHOD(LlamaRequest, next)
 
         zval result;
         json_to_zval(parsed, &result);
+        PHP_DBG(intern->request_id, "EXIT: returning parsed JSON as array");
         RETURN_ZVAL(&result, 0, 0);
 
     } catch (const std::exception &e) {
         // JSON parse error - return null
+        PHP_DBG(intern->request_id, "EXIT: JSON parse error: %s", e.what());
         RETURN_NULL();
     }
 }
@@ -579,9 +627,13 @@ static PHP_METHOD(LlamaRequest, cancel)
     ZEND_PARSE_PARAMETERS_NONE();
 
     LlamaRequestObject *intern = Z_LLAMA_REQUEST_P(ZEND_THIS);
+    PHP_DBG(intern->request_id, "ENTER");
 
     if (intern->cancelled) {
         intern->cancelled->store(true);
+        PHP_DBG(intern->request_id, "EXIT: cancelled set to true");
+    } else {
+        PHP_DBG(intern->request_id, "EXIT: no cancelled ptr");
     }
 }
 

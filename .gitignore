@@ -147,6 +147,7 @@ a.out.*
 /tools/server-coro/make.sh
 /tools/server-coro/libtool
 /tools/server-coro/modules
+/tools/server-coro/build
 /tools/server-coro/.libs
 /tools/server-coro/autom4te.cache
 /tools/server-coro/config.h
