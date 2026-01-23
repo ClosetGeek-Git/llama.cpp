@@ -140,3 +140,21 @@ poetry.toml
 a.out.*
 
 /tools/server-coro/node_modules
+/tools/server-coro/*.lo
+/tools/server-coro/*.dep
+/tools/server-coro/*.la
+/tools/server-coro/Makefile*
+/tools/server-coro/make.sh
+/tools/server-coro/libtool
+/tools/server-coro/modules
+/tools/server-coro/.libs
+/tools/server-coro/autom4te.cache
+/tools/server-coro/config.h
+/tools/server-coro/config.h.in
+/tools/server-coro/config.log
+/tools/server-coro/config.nice
+/tools/server-coro/config.status
+/tools/server-coro/configure
+/tools/server-coro/configure.ac
+/tools/server-coro/package-lock.json
+/tools/server-coro/*.php

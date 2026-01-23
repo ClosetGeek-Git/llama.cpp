@@ -27,6 +27,17 @@ Co::set(['hook_flags' => SWOOLE_HOOK_ALL]);
 // Server configuration
 const SERVER_HOST = '0.0.0.0';
 const SERVER_PORT = 9501;
+const PUBLIC_DIR = __DIR__ . '/public';
+
+/**
+ * Add CORS headers for browser access
+ */
+function add_cors_headers(Response $response): void
+{
+    $response->header('Access-Control-Allow-Origin', '*');
+    $response->header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    $response->header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
 
 /**
  * Convert Swoole HTTP Request to \Llama\Request params array
@@ -60,6 +71,7 @@ function swoole_request_to_llama_params(Request $request): array
  */
 function handle_streaming_response(\Llama\Request $llamaReq, Response $response): void
 {
+    add_cors_headers($response);
     $response->header('Content-Type', 'text/event-stream');
     $response->header('Cache-Control', 'no-cache');
     $response->header('Connection', 'keep-alive');
@@ -83,6 +95,7 @@ function handle_streaming_response(\Llama\Request $llamaReq, Response $response)
  */
 function handle_non_streaming_response(\Llama\Request $llamaReq, Response $response): void
 {
+    add_cors_headers($response);
     $response->header('Content-Type', 'application/json; charset=utf-8');
     $response->end($llamaReq->getData() ?? '{}');
 }
@@ -92,6 +105,15 @@ function handle_non_streaming_response(\Llama\Request $llamaReq, Response $respo
  */
 function handle_api_request(Request $request, Response $response): void
 {
+    add_cors_headers($response);
+    
+    // Handle OPTIONS preflight
+    if (($request->server['request_method'] ?? 'GET') === 'OPTIONS') {
+        $response->status(204);
+        $response->end();
+        return;
+    }
+    
     if (swoole_llama_ready() !== 1) {
         $response->header('Content-Type', 'application/json');
         $response->status(503);
@@ -119,6 +141,7 @@ function handle_api_request(Request $request, Response $response): void
  */
 function handle_health(Request $request, Response $response): void
 {
+    add_cors_headers($response);
     $response->header('Content-Type', 'application/json');
     $ready = swoole_llama_ready();
     
@@ -144,6 +167,20 @@ function create_server(): Server
     $server->handle('/health', 'handle_health');
     $server->handle('/v1/health', 'handle_health');
     
+    // Props endpoint for webui
+    $server->handle('/props', function (Request $request, Response $response) {
+        add_cors_headers($response);
+        $response->header('Content-Type', 'application/json');
+        $response->end(json_encode([
+            'default_generation_settings' => [
+                'n_ctx' => 4096,
+                'model' => basename($GLOBALS['argv'][array_search('-m', $GLOBALS['argv']) + 1] ?? 'model'),
+            ],
+            'total_slots' => 4,
+            'chat_template' => 'chatml',
+        ]));
+    });
+    
     // API endpoints
     $server->handle('/v1/models', 'handle_api_request');
     $server->handle('/v1/chat/completions', 'handle_api_request');
@@ -151,8 +188,30 @@ function create_server(): Server
     $server->handle('/v1/embeddings', 'handle_api_request');
     $server->handle('/test/stream', 'handle_api_request');
     
-    // Default 404 handler
+    // WebUI and catch-all
     $server->handle('/', function (Request $request, Response $response) {
+        $path = $request->server['request_uri'] ?? '/';
+        
+        // Serve webui only for root path
+        if ($path === '/' || $path === '/index.html') {
+            // CORS headers for pyodide (WASM)
+            $response->header('Cross-Origin-Embedder-Policy', 'require-corp');
+            $response->header('Cross-Origin-Opener-Policy', 'same-origin');
+            
+            // Serve loading.html if model not ready
+            if (swoole_llama_ready() !== 1) {
+                $response->header('Content-Type', 'text/html; charset=utf-8');
+                $response->sendfile(PUBLIC_DIR . '/loading.html');
+                return;
+            }
+            
+            // Serve main webui
+            $response->header('Content-Type', 'text/html; charset=utf-8');
+            $response->sendfile(PUBLIC_DIR . '/index.html');
+            return;
+        }
+        
+        // 404 for all other paths
         $response->header('Content-Type', 'application/json');
         $response->status(404);
         $response->end('{"error":{"message":"Not Found","code":404}}');
@@ -202,7 +261,8 @@ Co\run(function () use ($argv) {
     pcntl_signal(SIGTERM, $shutdown);
     
     echo "Listening on http://" . SERVER_HOST . ":" . SERVER_PORT . "\n";
-    echo "Endpoints: /health, /v1/models, /v1/chat/completions, /v1/completions, /v1/embeddings, /test/stream\n";
+    echo "WebUI: http://localhost:" . SERVER_PORT . "/\n";
+    echo "API: /v1/models, /v1/chat/completions, /v1/completions, /v1/embeddings\n";
     echo "Press Ctrl+C to stop\n\n";
     
     $server->start();

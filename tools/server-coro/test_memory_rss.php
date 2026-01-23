@@ -154,3 +154,4 @@ Coroutine\run(function() {
     echo "RSS after shutdown: " . number_format($rss_after) . " KB\n";
     echo "Freed: " . number_format($rss_final - $rss_after) . " KB\n";
 });
+dsf
