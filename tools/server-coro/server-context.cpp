@@ -4058,6 +4058,9 @@ void server_routes::init_routes() {
         if (req.get_header("X-Response-Type") == "raw") {
             res_type = TASK_RESPONSE_TYPE_RAW;
         }
+        if (req.get_header("X-Response-Type") == "sse") {
+            res_type = TASK_RESPONSE_TYPE_OAI_CHAT;
+        }        
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,

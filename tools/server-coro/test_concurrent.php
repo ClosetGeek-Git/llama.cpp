@@ -37,6 +37,10 @@ if (!extension_loaded('swoole_llama')) {
         "Name 5 colors",
         "Count backwards from 5 to 1",
     ];
+
+    $prompts = [
+        "Count from 1 to 10"
+    ];    
     
     $wg = new \Co\WaitGroup();
     $results = [];
@@ -49,7 +53,7 @@ if (!extension_loaded('swoole_llama')) {
                 'method' => 'POST',
                 'path' => '/v1/chat/completions',
                 'body' => json_encode([
-                    'model' => 'llama',
+                    'model' => '500M',
                     'messages' => [['role' => 'user', 'content' => $prompt]],
                     'max_tokens' => 64,
                     'temperature' => 0.0,

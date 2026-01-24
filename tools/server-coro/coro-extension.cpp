@@ -15,6 +15,8 @@
 #include <string>
 #include <map>
 #include <cstdlib>
+#include <mutex>
+#include <chrono>
 
 using json = nlohmann::ordered_json;
 
@@ -34,14 +36,88 @@ static bool php_debug_enabled() {
 // Request ID counter for tracking
 static std::atomic<int> g_request_id_counter{0};
 
-// Global state (equivalent to server.cpp locals)
-static common_params *g_params = nullptr;
-static server_context *g_ctx_server = nullptr;
-static server_routes *g_routes = nullptr;
-static std::thread g_inference_thread;
-static std::atomic<bool> g_initialized{false};
-static std::atomic<bool> g_model_loaded{false};
-static std::atomic<bool> g_model_load_failed{false};
+// Model status enum
+enum class ModelStatus {
+    LOADING,
+    LOADED,
+    FAILED,
+    UNLOADING
+};
+
+// Per-model instance
+struct ModelInstance {
+    std::string name;
+    common_params params;
+    std::unique_ptr<server_context> ctx_server;
+    std::unique_ptr<server_routes> routes;
+    std::thread inference_thread;
+    std::atomic<ModelStatus> status{ModelStatus::LOADING};
+    std::atomic<int64_t> last_used{0};
+    std::string error_message;
+    
+    void update_last_used() {
+        last_used.store(std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+};
+
+// Model registry
+static std::map<std::string, std::unique_ptr<ModelInstance>> g_models;
+static std::mutex g_models_mutex;
+static std::string g_legacy_model_name;
+static size_t g_models_max = 0;
+static std::atomic<bool> g_backend_initialized{false};
+
+// Extract model name from -m or --model argument (filename without .gguf)
+static std::string extract_model_name_from_argv(const std::vector<char*> &argv) {
+    for (size_t i = 0; i < argv.size(); i++) {
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argv.size()) {
+            std::string path = argv[i + 1];
+            size_t slash = path.find_last_of("/\\");
+            std::string filename = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+            if (filename.size() > 5 && filename.substr(filename.size() - 5) == ".gguf") {
+                filename = filename.substr(0, filename.size() - 5);
+            }
+            return filename;
+        }
+    }
+    return "";
+}
+
+// Extract model name from JSON body
+static std::string extract_model_name(const std::string &body) {
+    if (body.empty()) return "";
+    try {
+        json j = json::parse(body);
+        if (j.contains("model") && j["model"].is_string()) {
+            return j["model"].get<std::string>();
+        }
+    } catch (...) {}
+    return "";
+}
+
+// LRU eviction helper (must hold g_models_mutex when calling)
+static void evict_lru_if_needed() {
+    if (g_models_max == 0 || g_models.size() < g_models_max) return;
+    
+    std::string oldest_name;
+    int64_t oldest_time = INT64_MAX;
+    for (const auto &[name, inst] : g_models) {
+        if (inst->status.load() == ModelStatus::LOADED && inst->last_used.load() < oldest_time) {
+            oldest_time = inst->last_used.load();
+            oldest_name = name;
+        }
+    }
+    if (!oldest_name.empty()) {
+        auto it = g_models.find(oldest_name);
+        if (it != g_models.end()) {
+            it->second->ctx_server->terminate();
+            if (it->second->inference_thread.joinable()) {
+                it->second->inference_thread.join();
+            }
+            g_models.erase(it);
+        }
+    }
+}
 
 // Llama\Request class entry and handlers
 zend_class_entry *llama_request_ce = nullptr;
@@ -141,23 +217,25 @@ PHP_MINIT_FUNCTION(swoole_llama)
 // Module shutdown
 PHP_MSHUTDOWN_FUNCTION(swoole_llama)
 {
-    // Ensure cleanup if not already done
-    if (g_initialized.load()) {
-        if (g_ctx_server) {
-            g_ctx_server->terminate();
+    // Unload all models
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        for (auto &[name, inst] : g_models) {
+            if (inst->ctx_server) {
+                inst->ctx_server->terminate();
+            }
+            if (inst->inference_thread.joinable()) {
+                inst->inference_thread.join();
+            }
         }
-        if (g_inference_thread.joinable()) {
-            g_inference_thread.join();
-        }
-        delete g_routes;
-        g_routes = nullptr;
-        delete g_ctx_server;
-        g_ctx_server = nullptr;
-        delete g_params;
-        g_params = nullptr;
-        llama_backend_free();
-        g_initialized.store(false);
+        g_models.clear();
     }
+    
+    if (g_backend_initialized.load()) {
+        llama_backend_free();
+        g_backend_initialized.store(false);
+    }
+    
     return SUCCESS;
 }
 
@@ -179,11 +257,6 @@ PHP_FUNCTION(swoole_llama_init)
         Z_PARAM_ARRAY(z_argv)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (g_initialized.load()) {
-        php_error_docref(nullptr, E_WARNING, "llama context already initialized");
-        RETURN_FALSE;
-    }
-
     // Convert PHP array to argc/argv
     HashTable *ht = Z_ARRVAL_P(z_argv);
     int argc = zend_hash_num_elements(ht);
@@ -200,63 +273,86 @@ PHP_FUNCTION(swoole_llama_init)
         argv.push_back(const_cast<char*>(arg_storage.back().c_str()));
     } ZEND_HASH_FOREACH_END();
 
-    // Parse command-line arguments
-    g_params = new common_params();
-    if (!common_params_parse(argc, argv.data(), *g_params, LLAMA_EXAMPLE_SERVER)) {
-        delete g_params;
-        g_params = nullptr;
+    // Extract model name
+    std::string model_name = extract_model_name_from_argv(argv);
+    if (model_name.empty()) {
+        php_error_docref(nullptr, E_WARNING, "No model specified (-m or --model)");
+        RETURN_FALSE;
+    }
+
+    // Check if already loaded
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        if (g_models.find(model_name) != g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' already loaded", model_name.c_str());
+            RETURN_FALSE;
+        }
+    }
+
+    // Parse params
+    auto inst = std::make_unique<ModelInstance>();
+    inst->name = model_name;
+    if (!common_params_parse(argc, argv.data(), inst->params, LLAMA_EXAMPLE_SERVER)) {
         php_error_docref(nullptr, E_WARNING, "Failed to parse arguments");
         RETURN_FALSE;
     }
 
-    // Validate batch size for embeddings
-    if (g_params->embedding && g_params->n_batch > g_params->n_ubatch) {
-        g_params->n_batch = g_params->n_ubatch;
+    // Normalize params
+    if (inst->params.embedding && inst->params.n_batch > inst->params.n_ubatch) {
+        inst->params.n_batch = inst->params.n_ubatch;
+    }
+    if (inst->params.n_parallel < 0) {
+        inst->params.n_parallel = 4;
+        inst->params.kv_unified = true;
+    }
+    if (inst->params.model_alias.empty() && !inst->params.model.name.empty()) {
+        inst->params.model_alias = inst->params.model.name;
     }
 
-    // Auto n_parallel
-    if (g_params->n_parallel < 0) {
-        g_params->n_parallel = 4;
-        g_params->kv_unified = true;
+    // Initialize backend once
+    if (!g_backend_initialized.load()) {
+        common_init();
+        llama_backend_init();
+        llama_numa_init(inst->params.numa);
+        g_backend_initialized.store(true);
+        
+        // Read LLAMA_MODELS_MAX env
+        const char *max_env = getenv("LLAMA_MODELS_MAX");
+        if (max_env) g_models_max = std::max(0, atoi(max_env));
     }
 
-    // Model alias
-    if (g_params->model_alias.empty() && !g_params->model.name.empty()) {
-        g_params->model_alias = g_params->model.name;
-    }
+    // Create context and routes
+    inst->ctx_server = std::make_unique<server_context>();
+    inst->routes = std::make_unique<server_routes>(inst->params, *inst->ctx_server);
+    inst->update_last_used();
 
-    // Initialize common
-    common_init();
+    // Capture raw pointer for thread
+    ModelInstance *inst_ptr = inst.get();
 
-    // Create server context
-    g_ctx_server = new server_context();
-
-    // Initialize llama backend
-    llama_backend_init();
-    llama_numa_init(g_params->numa);
-
-    // Create routes (this initializes all handlers and registers route mappings)
-    g_routes = new server_routes(*g_params, *g_ctx_server);
-
-    // Start inference thread - model loading happens here, not on PHP thread
-    // This allows swoole_llama_init() to return immediately
-    g_inference_thread = std::thread([]() {
-        // Load model on inference thread
-        if (!g_ctx_server->load_model(*g_params)) {
-            g_model_load_failed.store(true);
-            return;
+    // Start inference thread
+    inst->inference_thread = std::thread([inst_ptr]() {
+        try {
+            if (!inst_ptr->ctx_server->load_model(inst_ptr->params)) {
+                inst_ptr->status.store(ModelStatus::FAILED);
+                inst_ptr->error_message = "Failed to load model";
+                return;
+            }
+            inst_ptr->routes->update_meta(*inst_ptr->ctx_server);
+            inst_ptr->status.store(ModelStatus::LOADED);
+            inst_ptr->ctx_server->start_loop();
+        } catch (const std::exception &e) {
+            inst_ptr->status.store(ModelStatus::FAILED);
+            inst_ptr->error_message = e.what();
         }
-
-        // Update metadata after model load
-        g_routes->update_meta(*g_ctx_server);
-
-        g_model_loaded.store(true);
-
-        // Run inference loop (blocks until terminate() called)
-        g_ctx_server->start_loop();
     });
 
-    g_initialized.store(true);
+    // Register in map
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        evict_lru_if_needed();
+        g_models[model_name] = std::move(inst);
+        g_legacy_model_name = model_name;
+    }
 
     RETURN_TRUE;
 }
@@ -264,52 +360,48 @@ PHP_FUNCTION(swoole_llama_init)
 // swoole_llama_ready(): int  (0 = not ready, 1 = ready, -1 = failed)
 PHP_FUNCTION(swoole_llama_ready)
 {
-    if (!g_initialized.load()) {
+    std::lock_guard<std::mutex> lock(g_models_mutex);
+    if (g_legacy_model_name.empty()) {
         RETURN_LONG(-1);
     }
-
-    if (g_model_load_failed.load()) {
+    auto it = g_models.find(g_legacy_model_name);
+    if (it == g_models.end()) {
         RETURN_LONG(-1);
     }
-
-    if (g_model_loaded.load()) {
+    ModelStatus status = it->second->status.load();
+    if (status == ModelStatus::FAILED) {
+        RETURN_LONG(-1);
+    }
+    if (status == ModelStatus::LOADED) {
         RETURN_LONG(1);
     }
-
     RETURN_LONG(0);
 }
 
 // swoole_llama_shutdown(): bool
 PHP_FUNCTION(swoole_llama_shutdown)
 {
-    if (!g_initialized.load()) {
+    std::unique_lock<std::mutex> lock(g_models_mutex);
+    if (g_legacy_model_name.empty()) {
         RETURN_TRUE;
     }
-
-    // Terminate inference loop (unblocks start_loop)
-    g_ctx_server->terminate();
-
-    // Wait for inference thread to finish
-    if (g_inference_thread.joinable()) {
-        g_inference_thread.join();
+    auto it = g_models.find(g_legacy_model_name);
+    if (it == g_models.end()) {
+        RETURN_TRUE;
     }
-
-    // Cleanup in reverse order
-    delete g_routes;
-    g_routes = nullptr;
-
-    delete g_ctx_server;
-    g_ctx_server = nullptr;
-
-    delete g_params;
-    g_params = nullptr;
-
-    llama_backend_free();
-
-    g_initialized.store(false);
-    g_model_loaded.store(false);
-    g_model_load_failed.store(false);
-
+    
+    it->second->ctx_server->terminate();
+    
+    // Release lock while joining thread
+    std::thread thread_to_join = std::move(it->second->inference_thread);
+    g_models.erase(it);
+    g_legacy_model_name.clear();
+    lock.unlock();
+    
+    if (thread_to_join.joinable()) {
+        thread_to_join.join();
+    }
+    
     RETURN_TRUE;
 }
 
@@ -416,7 +508,9 @@ static bool php_array_to_request(zval *z_request, server_http_req &req, std::sha
     req.should_stop = [cancelled]() { return cancelled->load(); };
 
     // Request raw JSON format (no SSE wrapper)
-    req.headers["X-Response-Type"].push_back("raw");
+    if (req.headers.find("X-Response-Type") == req.headers.end()) {
+        req.headers["X-Response-Type"].push_back("raw");
+    }
 
     return true;
 }
@@ -433,12 +527,6 @@ static PHP_METHOD(LlamaRequest, __construct)
         Z_PARAM_ARRAY(z_params)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_routes) {
-        PHP_DBG(req_id, "ERROR: llama context not initialized");
-        zend_throw_exception(zend_ce_exception, "llama context not initialized", 0);
-        RETURN_THROWS();
-    }
-
     LlamaRequestObject *intern = Z_LLAMA_REQUEST_P(ZEND_THIS);
     intern->request_id = req_id;
 
@@ -452,10 +540,38 @@ static PHP_METHOD(LlamaRequest, __construct)
     PHP_DBG(req_id, "parsed: method=%s path=%s body_len=%zu", 
             intern->request.method.c_str(), intern->request.path.c_str(), intern->request.body.size());
 
+    // Extract model name from request body (REQUIRED)
+    std::string model_name = extract_model_name(intern->request.body);
+    if (model_name.empty()) {
+        PHP_DBG(req_id, "ERROR: no 'model' field in request body");
+        zend_throw_exception(zend_ce_exception, "No 'model' field in request body", 0);
+        RETURN_THROWS();
+    }
+
+    // Look up model instance
+    ModelInstance *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        auto it = g_models.find(model_name);
+        if (it == g_models.end()) {
+            PHP_DBG(req_id, "ERROR: model '%s' not found", model_name.c_str());
+            zend_throw_exception_ex(zend_ce_exception, 0, "Model '%s' not found", model_name.c_str());
+            RETURN_THROWS();
+        }
+        inst = it->second.get();
+        inst->update_last_used();
+    }
+
+    if (inst->status.load() != ModelStatus::LOADED) {
+        PHP_DBG(req_id, "ERROR: model '%s' not ready", model_name.c_str());
+        zend_throw_exception_ex(zend_ce_exception, 0, "Model '%s' is not ready", model_name.c_str());
+        RETURN_THROWS();
+    }
+
     // Find handler using path matching
     std::map<std::string, std::string> path_params;
     PHP_DBG(req_id, "finding handler...");
-    const server_http_context::handler_t *handler = g_routes->find_handler(intern->request.method, intern->request.path, path_params);
+    const server_http_context::handler_t *handler = inst->routes->find_handler(intern->request.method, intern->request.path, path_params);
 
     if (!handler) {
         PHP_DBG(req_id, "ERROR: No handler found");
@@ -645,11 +761,212 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_void, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_load_model, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, argv, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_model_ready, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_unload_model, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_list_models, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+// swoole_llama_load_model(array $argv): bool
+PHP_FUNCTION(swoole_llama_load_model)
+{
+    zval *z_argv;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY(z_argv)
+    ZEND_PARSE_PARAMETERS_END();
+
+    // Convert PHP array to argc/argv
+    HashTable *ht = Z_ARRVAL_P(z_argv);
+    int argc = zend_hash_num_elements(ht);
+
+    std::vector<std::string> arg_storage;
+    std::vector<char*> argv;
+    arg_storage.reserve(argc);
+    argv.reserve(argc);
+
+    zval *val;
+    ZEND_HASH_FOREACH_VAL(ht, val) {
+        convert_to_string(val);
+        arg_storage.push_back(std::string(Z_STRVAL_P(val), Z_STRLEN_P(val)));
+        argv.push_back(const_cast<char*>(arg_storage.back().c_str()));
+    } ZEND_HASH_FOREACH_END();
+
+    // Extract model name
+    std::string model_name = extract_model_name_from_argv(argv);
+    if (model_name.empty()) {
+        php_error_docref(nullptr, E_WARNING, "No model specified (-m or --model)");
+        RETURN_FALSE;
+    }
+
+    // Check if already loaded
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        if (g_models.find(model_name) != g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' already loaded", model_name.c_str());
+            RETURN_FALSE;
+        }
+    }
+
+    // Parse params
+    auto inst = std::make_unique<ModelInstance>();
+    inst->name = model_name;
+    if (!common_params_parse(argc, argv.data(), inst->params, LLAMA_EXAMPLE_SERVER)) {
+        php_error_docref(nullptr, E_WARNING, "Failed to parse arguments for model '%s'", model_name.c_str());
+        RETURN_FALSE;
+    }
+
+    // Normalize params
+    if (inst->params.embedding && inst->params.n_batch > inst->params.n_ubatch) {
+        inst->params.n_batch = inst->params.n_ubatch;
+    }
+    if (inst->params.n_parallel < 0) {
+        inst->params.n_parallel = 4;
+        inst->params.kv_unified = true;
+    }
+    if (inst->params.model_alias.empty() && !inst->params.model.name.empty()) {
+        inst->params.model_alias = inst->params.model.name;
+    }
+
+    // Initialize backend once
+    if (!g_backend_initialized.load()) {
+        common_init();
+        llama_backend_init();
+        llama_numa_init(inst->params.numa);
+        g_backend_initialized.store(true);
+        
+        // Read LLAMA_MODELS_MAX env
+        const char *max_env = getenv("LLAMA_MODELS_MAX");
+        if (max_env) g_models_max = std::max(0, atoi(max_env));
+    }
+
+    // Create context and routes
+    inst->ctx_server = std::make_unique<server_context>();
+    inst->routes = std::make_unique<server_routes>(inst->params, *inst->ctx_server);
+    inst->update_last_used();
+
+    // Capture raw pointer for thread
+    ModelInstance *inst_ptr = inst.get();
+
+    // Start inference thread
+    inst->inference_thread = std::thread([inst_ptr]() {
+        try {
+            if (!inst_ptr->ctx_server->load_model(inst_ptr->params)) {
+                inst_ptr->status.store(ModelStatus::FAILED);
+                inst_ptr->error_message = "Failed to load model";
+                return;
+            }
+            inst_ptr->routes->update_meta(*inst_ptr->ctx_server);
+            inst_ptr->status.store(ModelStatus::LOADED);
+            inst_ptr->ctx_server->start_loop();
+        } catch (const std::exception &e) {
+            inst_ptr->status.store(ModelStatus::FAILED);
+            inst_ptr->error_message = e.what();
+        }
+    });
+
+    // Register in map
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        evict_lru_if_needed();
+        g_models[model_name] = std::move(inst);
+    }
+
+    RETURN_TRUE;
+}
+
+// swoole_llama_model_ready(string $name): int
+PHP_FUNCTION(swoole_llama_model_ready)
+{
+    zend_string *z_name;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(z_name)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string name(ZSTR_VAL(z_name), ZSTR_LEN(z_name));
+    
+    std::lock_guard<std::mutex> lock(g_models_mutex);
+    auto it = g_models.find(name);
+    if (it == g_models.end()) {
+        RETURN_LONG(-1);
+    }
+    ModelStatus status = it->second->status.load();
+    if (status == ModelStatus::FAILED) RETURN_LONG(-1);
+    if (status == ModelStatus::LOADED) RETURN_LONG(1);
+    RETURN_LONG(0);
+}
+
+// swoole_llama_unload_model(string $name): bool
+PHP_FUNCTION(swoole_llama_unload_model)
+{
+    zend_string *z_name;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(z_name)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string name(ZSTR_VAL(z_name), ZSTR_LEN(z_name));
+    
+    std::unique_lock<std::mutex> lock(g_models_mutex);
+    auto it = g_models.find(name);
+    if (it == g_models.end()) {
+        RETURN_FALSE;
+    }
+    
+    it->second->ctx_server->terminate();
+    
+    // Release lock while joining thread
+    std::thread thread_to_join = std::move(it->second->inference_thread);
+    g_models.erase(it);
+    lock.unlock();
+    
+    if (thread_to_join.joinable()) {
+        thread_to_join.join();
+    }
+    RETURN_TRUE;
+}
+
+// swoole_llama_list_models(): array
+PHP_FUNCTION(swoole_llama_list_models)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    
+    array_init(return_value);
+    
+    std::lock_guard<std::mutex> lock(g_models_mutex);
+    for (const auto &[name, inst] : g_models) {
+        zval model_info;
+        array_init(&model_info);
+        add_assoc_string(&model_info, "name", name.c_str());
+        const char *status_str = "unknown";
+        switch (inst->status.load()) {
+            case ModelStatus::LOADING: status_str = "loading"; break;
+            case ModelStatus::LOADED: status_str = "loaded"; break;
+            case ModelStatus::FAILED: status_str = "failed"; break;
+            case ModelStatus::UNLOADING: status_str = "unloading"; break;
+        }
+        add_assoc_string(&model_info, "status", status_str);
+        add_next_index_zval(return_value, &model_info);
+    }
+}
+
 // Function entries
 static const zend_function_entry swoole_llama_functions[] = {
     PHP_FE(swoole_llama_init, arginfo_swoole_llama_init)
     PHP_FE(swoole_llama_ready, arginfo_swoole_llama_void)
     PHP_FE(swoole_llama_shutdown, arginfo_swoole_llama_void)
+    PHP_FE(swoole_llama_load_model, arginfo_swoole_llama_load_model)
+    PHP_FE(swoole_llama_model_ready, arginfo_swoole_llama_model_ready)
+    PHP_FE(swoole_llama_unload_model, arginfo_swoole_llama_unload_model)
+    PHP_FE(swoole_llama_list_models, arginfo_swoole_llama_list_models)
     PHP_FE_END
 };
 

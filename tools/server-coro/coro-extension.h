@@ -29,6 +29,10 @@ PHP_MINFO_FUNCTION(swoole_llama);
 PHP_FUNCTION(swoole_llama_init);
 PHP_FUNCTION(swoole_llama_ready);
 PHP_FUNCTION(swoole_llama_shutdown);
+PHP_FUNCTION(swoole_llama_load_model);
+PHP_FUNCTION(swoole_llama_model_ready);
+PHP_FUNCTION(swoole_llama_unload_model);
+PHP_FUNCTION(swoole_llama_list_models);
 
 // Llama\Request class entry
 extern zend_class_entry *llama_request_ce;
