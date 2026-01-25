@@ -10,6 +10,7 @@
 #include <memory>
 #include <vector>
 #include <cstdint>
+#include <queue>
 
 struct common_params;
 struct server_context;
@@ -34,6 +35,7 @@ struct server_http_res {
     std::string reason_phrase;           // PSR-7: "OK", "Not Found", etc. (optional)
     std::string protocol_version = "1.1"; // PSR-7: "1.0", "1.1", "2"
     std::string data;
+    std::queue<std::string> pending_chunks;  // For multi-element RAW chunks
     http_headers_t headers;
 
     // streaming: if set, chunks are pulled via next()

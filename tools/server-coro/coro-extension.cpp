@@ -7,6 +7,7 @@
 #include "arg.h"
 #include "llama.h"
 #include "log.h"
+#include "server-common.h"
 
 #include <atomic>
 #include <memory>
@@ -126,6 +127,7 @@ static zend_object_handlers llama_request_handlers;
 // Forward declarations for class methods
 static PHP_METHOD(LlamaRequest, __construct);
 static PHP_METHOD(LlamaRequest, isStream);
+static PHP_METHOD(LlamaRequest, getStatusCode);
 static PHP_METHOD(LlamaRequest, getData);
 static PHP_METHOD(LlamaRequest, next);
 static PHP_METHOD(LlamaRequest, cancel);
@@ -178,7 +180,10 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_llama_request_isStream, 0, 0, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_llama_request_getData, 0, 0, IS_STRING, 1)
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_llama_request_getStatusCode, 0, 0, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_llama_request_getData, 0, 0, IS_ARRAY, 1)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_llama_request_next, 0, 0, IS_ARRAY, 1)
@@ -191,6 +196,7 @@ ZEND_END_ARG_INFO()
 static const zend_function_entry llama_request_methods[] = {
     PHP_ME(LlamaRequest, __construct, arginfo_llama_request_construct, ZEND_ACC_PUBLIC)
     PHP_ME(LlamaRequest, isStream, arginfo_llama_request_isStream, ZEND_ACC_PUBLIC)
+    PHP_ME(LlamaRequest, getStatusCode, arginfo_llama_request_getStatusCode, ZEND_ACC_PUBLIC)
     PHP_ME(LlamaRequest, getData, arginfo_llama_request_getData, ZEND_ACC_PUBLIC)
     PHP_ME(LlamaRequest, next, arginfo_llama_request_next, ZEND_ACC_PUBLIC)
     PHP_ME(LlamaRequest, cancel, arginfo_llama_request_cancel, ZEND_ACC_PUBLIC)
@@ -534,8 +540,13 @@ static PHP_METHOD(LlamaRequest, __construct)
     PHP_DBG(req_id, "parsing request array...");
     if (!php_array_to_request(z_params, intern->request, intern->cancelled)) {
         PHP_DBG(req_id, "ERROR: Invalid request format");
-        zend_throw_exception(zend_ce_exception, "Invalid request format", 0);
-        RETURN_THROWS();
+        // Return OAI error response instead of throwing
+        json error_json = format_error_response("Invalid request format", ERROR_TYPE_INVALID_REQUEST);
+        intern->response = std::make_unique<server_http_res>();
+        intern->response->status = 400;
+        intern->response->data = json{{"error", error_json}}.dump();
+        intern->is_stream = false;
+        return;
     }
     PHP_DBG(req_id, "parsed: method=%s path=%s body_len=%zu", 
             intern->request.method.c_str(), intern->request.path.c_str(), intern->request.body.size());
@@ -544,8 +555,13 @@ static PHP_METHOD(LlamaRequest, __construct)
     std::string model_name = extract_model_name(intern->request.body);
     if (model_name.empty()) {
         PHP_DBG(req_id, "ERROR: no 'model' field in request body");
-        zend_throw_exception(zend_ce_exception, "No 'model' field in request body", 0);
-        RETURN_THROWS();
+        // Return OAI error response instead of throwing
+        json error_json = format_error_response("No 'model' field in request body", ERROR_TYPE_INVALID_REQUEST);
+        intern->response = std::make_unique<server_http_res>();
+        intern->response->status = 400;
+        intern->response->data = json{{"error", error_json}}.dump();
+        intern->is_stream = false;
+        return;
     }
 
     // Look up model instance
@@ -555,8 +571,13 @@ static PHP_METHOD(LlamaRequest, __construct)
         auto it = g_models.find(model_name);
         if (it == g_models.end()) {
             PHP_DBG(req_id, "ERROR: model '%s' not found", model_name.c_str());
-            zend_throw_exception_ex(zend_ce_exception, 0, "Model '%s' not found", model_name.c_str());
-            RETURN_THROWS();
+            // Return OAI error response instead of throwing
+            json error_json = format_error_response("Model '" + model_name + "' not found", ERROR_TYPE_NOT_FOUND);
+            intern->response = std::make_unique<server_http_res>();
+            intern->response->status = 404;
+            intern->response->data = json{{"error", error_json}}.dump();
+            intern->is_stream = false;
+            return;
         }
         inst = it->second.get();
         inst->update_last_used();
@@ -564,8 +585,13 @@ static PHP_METHOD(LlamaRequest, __construct)
 
     if (inst->status.load() != ModelStatus::LOADED) {
         PHP_DBG(req_id, "ERROR: model '%s' not ready", model_name.c_str());
-        zend_throw_exception_ex(zend_ce_exception, 0, "Model '%s' is not ready", model_name.c_str());
-        RETURN_THROWS();
+        // Return OAI error response instead of throwing
+        json error_json = format_error_response("Model '" + model_name + "' is not ready", ERROR_TYPE_UNAVAILABLE);
+        intern->response = std::make_unique<server_http_res>();
+        intern->response->status = 503;
+        intern->response->data = json{{"error", error_json}}.dump();
+        intern->is_stream = false;
+        return;
     }
 
     // Find handler using path matching
@@ -575,9 +601,14 @@ static PHP_METHOD(LlamaRequest, __construct)
 
     if (!handler) {
         PHP_DBG(req_id, "ERROR: No handler found");
-        zend_throw_exception_ex(zend_ce_exception, 0,
-            "No handler for %s %s", intern->request.method.c_str(), intern->request.path.c_str());
-        RETURN_THROWS();
+        // Return OAI error response instead of throwing
+        std::string msg = "No handler for " + intern->request.method + " " + intern->request.path;
+        json error_json = format_error_response(msg, ERROR_TYPE_NOT_FOUND);
+        intern->response = std::make_unique<server_http_res>();
+        intern->response->status = 404;
+        intern->response->data = json{{"error", error_json}}.dump();
+        intern->is_stream = false;
+        return;
     }
     PHP_DBG(req_id, "handler found, path_params=%zu", path_params.size());
 
@@ -592,19 +623,59 @@ static PHP_METHOD(LlamaRequest, __construct)
         intern->response = (*handler)(intern->request);
     } catch (const std::exception &e) {
         PHP_DBG(req_id, "ERROR: handler threw exception: %s", e.what());
-        zend_throw_exception_ex(zend_ce_exception, 0, "Handler error: %s", e.what());
-        RETURN_THROWS();
+        // Return OAI error response instead of throwing
+        json error_json = format_error_response(std::string("Handler error: ") + e.what(), ERROR_TYPE_SERVER);
+        intern->response = std::make_unique<server_http_res>();
+        intern->response->status = 500;
+        intern->response->data = json{{"error", error_json}}.dump();
+        intern->is_stream = false;
+        return;
     }
     PHP_DBG(req_id, "handler returned");
 
     if (!intern->response) {
         PHP_DBG(req_id, "ERROR: handler returned null response");
-        zend_throw_exception(zend_ce_exception, "Handler returned null response", 0);
-        RETURN_THROWS();
+        // Return OAI error response instead of throwing
+        json error_json = format_error_response("Handler returned null response", ERROR_TYPE_SERVER);
+        intern->response = std::make_unique<server_http_res>();
+        intern->response->status = 500;
+        intern->response->data = json{{"error", error_json}}.dump();
+        intern->is_stream = false;
+        return;
     }
 
     intern->is_stream = intern->response->is_stream();
     PHP_DBG(req_id, "EXIT: is_stream=%d response_data_len=%zu", intern->is_stream, intern->response->data.size());
+}
+
+// Static helper: Convert nlohmann::json to PHP zval (recursive)
+static void json_to_zval(const json &j, zval *z) {
+    if (j.is_null()) {
+        ZVAL_NULL(z);
+    } else if (j.is_boolean()) {
+        ZVAL_BOOL(z, j.get<bool>());
+    } else if (j.is_number_integer()) {
+        ZVAL_LONG(z, j.get<int64_t>());
+    } else if (j.is_number_float()) {
+        ZVAL_DOUBLE(z, j.get<double>());
+    } else if (j.is_string()) {
+        const std::string &s = j.get_ref<const std::string &>();
+        ZVAL_STRINGL(z, s.c_str(), s.length());
+    } else if (j.is_array()) {
+        array_init(z);
+        for (size_t i = 0; i < j.size(); i++) {
+            zval elem;
+            json_to_zval(j[i], &elem);
+            add_next_index_zval(z, &elem);
+        }
+    } else if (j.is_object()) {
+        array_init(z);
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            zval elem;
+            json_to_zval(it.value(), &elem);
+            add_assoc_zval(z, it.key().c_str(), &elem);
+        }
+    }
 }
 
 // Llama\Request::isStream(): bool
@@ -617,7 +688,18 @@ static PHP_METHOD(LlamaRequest, isStream)
     RETURN_BOOL(intern->is_stream);
 }
 
-// Llama\Request::getData(): ?string
+// Llama\Request::getStatusCode(): int
+static PHP_METHOD(LlamaRequest, getStatusCode)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    LlamaRequestObject *intern = Z_LLAMA_REQUEST_P(ZEND_THIS);
+    int status = intern->response ? intern->response->status : 200;
+    PHP_DBG(intern->request_id, "status=%d", status);
+    RETURN_LONG(status);
+}
+
+// Llama\Request::getData(): ?array
 static PHP_METHOD(LlamaRequest, getData)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -630,20 +712,38 @@ static PHP_METHOD(LlamaRequest, getData)
         RETURN_NULL();
     }
 
+    std::string chunk;
     if (intern->is_stream) {
-        // For streaming: return first chunk from response->data
-        if (!intern->response->data.empty()) {
-            std::string first_chunk = std::move(intern->response->data);
-            intern->response->data.clear();
-            PHP_DBG(intern->request_id, "EXIT (stream): returning first chunk, len=%zu", first_chunk.length());
-            RETURN_STRINGL(first_chunk.c_str(), first_chunk.length());
+        // For streaming: get first chunk from response->data
+        if (intern->response->data.empty()) {
+            PHP_DBG(intern->request_id, "EXIT (stream): no data, returning null");
+            RETURN_NULL();
         }
-        PHP_DBG(intern->request_id, "EXIT (stream): no data, returning null");
-        RETURN_NULL();
+        chunk = std::move(intern->response->data);
+        intern->response->data.clear();
     } else {
-        // For non-streaming: return response->data
-        PHP_DBG(intern->request_id, "EXIT (non-stream): returning data, len=%zu", intern->response->data.length());
-        RETURN_STRINGL(intern->response->data.c_str(), intern->response->data.length());
+        // For non-streaming: get full response from response->data
+        chunk = intern->response->data;
+    }
+
+    // Strip trailing newline
+    if (!chunk.empty() && chunk.back() == '\n') {
+        chunk.pop_back();
+    }
+    if (chunk.empty()) {
+        RETURN_NULL();
+    }
+
+    // Parse JSON and convert to PHP array
+    try {
+        json parsed = json::parse(chunk);
+        zval result;
+        json_to_zval(parsed, &result);
+        PHP_DBG(intern->request_id, "EXIT: returning parsed JSON as array, len=%zu", chunk.length());
+        RETURN_ZVAL(&result, 0, 0);
+    } catch (const std::exception &e) {
+        PHP_DBG(intern->request_id, "EXIT: JSON parse error: %s", e.what());
+        RETURN_NULL();
     }
 }
 
@@ -673,7 +773,7 @@ static PHP_METHOD(LlamaRequest, next)
         }
 
         if (!chunk.empty()) {
-            PHP_DBG(intern->request_id, "got chunk, len=%zu", chunk.size());
+            PHP_DBG(intern->request_id, "got chunk, len=%zu, first100=[%.*s]", chunk.size(), (int)std::min(chunk.size(), (size_t)100), chunk.c_str());
             break;
         }
         // Empty chunk but has_more=true means flush/continue, keep looping
@@ -692,39 +792,6 @@ static PHP_METHOD(LlamaRequest, next)
         }
 
         json parsed = json::parse(chunk);
-
-        // Convert JSON to PHP array
-        // Simple recursive JSON to PHP array conversion
-        std::function<void(const json &, zval *)> json_to_zval;
-        json_to_zval = [&json_to_zval](const json &j, zval *z) {
-            if (j.is_null()) {
-                ZVAL_NULL(z);
-            } else if (j.is_boolean()) {
-                ZVAL_BOOL(z, j.get<bool>());
-            } else if (j.is_number_integer()) {
-                ZVAL_LONG(z, j.get<int64_t>());
-            } else if (j.is_number_float()) {
-                ZVAL_DOUBLE(z, j.get<double>());
-            } else if (j.is_string()) {
-                const std::string &s = j.get_ref<const std::string &>();
-                ZVAL_STRINGL(z, s.c_str(), s.length());
-            } else if (j.is_array()) {
-                array_init(z);
-                for (size_t i = 0; i < j.size(); i++) {
-                    zval elem;
-                    json_to_zval(j[i], &elem);
-                    add_next_index_zval(z, &elem);
-                }
-            } else if (j.is_object()) {
-                array_init(z);
-                for (auto it = j.begin(); it != j.end(); ++it) {
-                    zval elem;
-                    json_to_zval(it.value(), &elem);
-                    add_assoc_zval(z, it.key().c_str(), &elem);
-                }
-            }
-        };
-
         zval result;
         json_to_zval(parsed, &result);
         PHP_DBG(intern->request_id, "EXIT: returning parsed JSON as array");

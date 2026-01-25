@@ -3431,14 +3431,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
             res->data = format_anthropic_sse(first_result_json);
         } else if (res_type == TASK_RESPONSE_TYPE_RAW) {
-            // RAW format: iterate array and output each element on a line
-            if (first_result_json.is_array()) {
-                std::string combined;
-                for (const auto & elem : first_result_json) {
-                    combined += elem.dump() + "\n";
+            // RAW format: first element to data, rest to pending_chunks
+            if (first_result_json.is_array() && !first_result_json.empty()) {
+                res->data = first_result_json[0].dump() + "\n";
+                for (size_t i = 1; i < first_result_json.size(); ++i) {
+                    res->pending_chunks.push(first_result_json[i].dump() + "\n");
                 }
-                res->data = combined;
-            } else {
+            } else if (!first_result_json.is_array()) {
                 res->data = first_result_json.dump() + "\n";
             }
         } else {
@@ -3470,6 +3469,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     // flush the first chunk
                     output = std::move(res_this->data);
                     res_this->data.clear();
+                    return true;
+                }
+
+                // Drain pending_chunks first (RAW format multi-element arrays)
+                if (!res_this->pending_chunks.empty()) {
+                    output = std::move(res_this->pending_chunks.front());
+                    res_this->pending_chunks.pop();
                     return true;
                 }
 
@@ -3515,14 +3521,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
                     } else if (res_type == TASK_RESPONSE_TYPE_RAW) {
-                        // RAW format: iterate array and output each element on a line
-                        if (res_json.is_array()) {
-                            std::string combined;
-                            for (const auto & elem : res_json) {
-                                combined += elem.dump() + "\n";
+                        // RAW format: first element to output, rest to pending_chunks
+                        if (res_json.is_array() && !res_json.empty()) {
+                            output = res_json[0].dump() + "\n";
+                            for (size_t i = 1; i < res_json.size(); ++i) {
+                                res_this->pending_chunks.push(res_json[i].dump() + "\n");
                             }
-                            output = combined;
-                        } else {
+                        } else if (!res_json.is_array()) {
                             output = res_json.dump() + "\n";
                         }
                     } else {
