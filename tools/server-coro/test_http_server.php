@@ -97,7 +97,9 @@ function handle_non_streaming_response(\Llama\Request $llamaReq, Response $respo
 {
     add_cors_headers($response);
     $response->header('Content-Type', 'application/json; charset=utf-8');
-    $response->end($llamaReq->getData() ?? '{}');
+    $response->status($llamaReq->getStatusCode());
+    $data = $llamaReq->getData();
+    $response->end(json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
 }
 
 /**

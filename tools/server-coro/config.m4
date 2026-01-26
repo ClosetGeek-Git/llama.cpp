@@ -82,13 +82,14 @@ if test "$PHP_SWOOLE_LLAMA" != "no"; then
     PHP_ADD_LIBPATH($LLAMA_BUILD_DIR/bin, SWOOLE_LLAMA_SHARED_LIBADD)
     PHP_ADD_LIBPATH($LLAMA_BUILD_DIR/common, SWOOLE_LLAMA_SHARED_LIBADD)
 
-    dnl Link libraries - llama.cpp (matching CMakeLists.txt minus libswoole.so)
-    dnl Swoole symbols come from Swoole extension loaded at runtime
+    dnl Link libraries - llama.cpp core only
+    dnl GPU/CPU backends are loaded dynamically at runtime via ggml_backend_load_all()
     PHP_ADD_LIBRARY(llama, 1, SWOOLE_LLAMA_SHARED_LIBADD)
     PHP_ADD_LIBRARY(ggml, 1, SWOOLE_LLAMA_SHARED_LIBADD)
     PHP_ADD_LIBRARY(ggml-base, 1, SWOOLE_LLAMA_SHARED_LIBADD)
-    PHP_ADD_LIBRARY(ggml-cpu, 1, SWOOLE_LLAMA_SHARED_LIBADD)
     PHP_ADD_LIBRARY(mtmd, 1, SWOOLE_LLAMA_SHARED_LIBADD)
+
+    dnl System libraries
     PHP_ADD_LIBRARY(ssl, 1, SWOOLE_LLAMA_SHARED_LIBADD)
     PHP_ADD_LIBRARY(crypto, 1, SWOOLE_LLAMA_SHARED_LIBADD)
     PHP_ADD_LIBRARY(pthread, 1, SWOOLE_LLAMA_SHARED_LIBADD)
