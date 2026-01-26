@@ -1227,6 +1227,28 @@ json server_task_result_rerank::to_json() {
     };
 }
 
+//
+// server_task_result_classify
+//
+json server_task_result_classify::to_json() {
+    json arr = json::array();
+    for (const auto & pred : predictions) {
+        arr.push_back({
+            {"label", pred.first},
+            {"score", pred.second}
+        });
+    }
+    // Sort by score descending
+    std::sort(arr.begin(), arr.end(), [](const json & a, const json & b) {
+        return a["score"].get<float>() > b["score"].get<float>();
+    });
+    return json {
+        {"index",            index},
+        {"predictions",      arr},
+        {"tokens_evaluated", n_tokens},
+    };
+}
+
 json server_task_result_cmpl_partial::to_json_anthropic() {
     json events = json::array();
     bool first = (n_decoded == 1);

@@ -1599,6 +1599,42 @@ private:
         queue_results.send(std::move(res));
     }
 
+    void send_classify(const server_slot & slot, const llama_batch & batch) {
+        auto res = std::make_unique<server_task_result_classify>();
+        res->id       = slot.task->id;
+        res->index    = slot.task->index;
+        res->n_tokens = slot.task->n_tokens();
+
+        const uint32_t n_cls = llama_model_n_cls_out(model);
+
+        // For classification, we need the pooled sequence embedding (one per input)
+        // Use llama_get_embeddings_seq which returns the classification logits
+        const float * embd = llama_get_embeddings_seq(ctx, slot.id);
+        if (embd == NULL) {
+            // Fallback: find the last token with logits enabled
+            for (int i = batch.n_tokens - 1; i >= 0; --i) {
+                if (batch.logits[i] && batch.seq_id[i][0] == slot.id) {
+                    embd = llama_get_embeddings_ith(ctx, i);
+                    break;
+                }
+            }
+        }
+
+        if (embd == NULL) {
+            SLT_ERR(slot, "failed to get embeddings for classification, seq_id = %d\n", slot.id);
+        } else {
+            for (uint32_t c = 0; c < n_cls; ++c) {
+                const char * label = llama_model_cls_label(model, c);
+                std::string label_str = label ? label : ("LABEL_" + std::to_string(c));
+                res->predictions.emplace_back(label_str, embd[c]);
+            }
+        }
+
+        SLT_DBG(slot, "sending classify result, n_predictions = %zu\n", res->predictions.size());
+
+        queue_results.send(std::move(res));
+    }
+
     //
     // Functions to process the task
     //
@@ -1703,6 +1739,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_CLASSIFY:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -2981,6 +3018,13 @@ private:
                         continue; // continue loop of slots
                     }
 
+                    if (slot.task->type == SERVER_TASK_TYPE_CLASSIFY) {
+                        send_classify(slot, batch_view);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue; // continue loop of slots
+                    }
+
                     GGML_ASSERT(slot.task->need_sampling());
 
                     // prompt evaluated for next-token prediction
@@ -3661,6 +3705,8 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
     register_route("POST", "/reranking", &post_rerank);
     register_route("POST", "/v1/rerank", &post_rerank);
     register_route("POST", "/v1/reranking", &post_rerank);
+    register_route("POST", "/classify", &post_classify);
+    register_route("POST", "/v1/classify", &post_classify);
     register_route("POST", "/tokenize", &post_tokenize);
     register_route("POST", "/detokenize", &post_detokenize);
     register_route("POST", "/apply-template", &post_apply_template);
@@ -4311,6 +4357,87 @@ void server_routes::init_routes() {
             documents,
             top_n);
 
+        res->ok(root);
+        return res;
+    };
+
+    this->post_classify = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
+            res->error(format_error_response("This server does not support classification. Start it with `--reranking` and a classifier model", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const uint32_t n_cls = llama_model_n_cls_out(ctx_server.model);
+        if (n_cls <= 1) {
+            res->error(format_error_response("Model does not have classification outputs. Use a BertForSequenceClassification model.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const json body = json::parse(req.body);
+
+        // TEI-compatible: "inputs" can be string or array of strings
+        std::vector<std::string> inputs;
+        if (body.contains("inputs")) {
+            if (body.at("inputs").is_string()) {
+                inputs.push_back(body.at("inputs").get<std::string>());
+            } else if (body.at("inputs").is_array()) {
+                for (const auto & inp : body.at("inputs")) {
+                    if (!inp.is_string()) {
+                        res->error(format_error_response("\"inputs\" array must contain strings", ERROR_TYPE_INVALID_REQUEST));
+                        return res;
+                    }
+                    inputs.push_back(inp.get<std::string>());
+                }
+            } else {
+                res->error(format_error_response("\"inputs\" must be a string or array of strings", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        } else {
+            res->error(format_error_response("\"inputs\" must be provided", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        if (inputs.empty()) {
+            res->error(format_error_response("\"inputs\" must not be empty", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // create and queue the tasks
+        json responses = json::array();
+        auto & rd = res->rd;
+        {
+            std::vector<server_task> tasks;
+            tasks.reserve(inputs.size());
+            for (size_t i = 0; i < inputs.size(); i++) {
+                server_task task = server_task(SERVER_TASK_TYPE_CLASSIFY);
+                task.id     = rd.get_new_id();
+                task.index  = i;
+                task.tokens = std::move(tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, inputs[i], true, true)[0]);
+                tasks.push_back(std::move(task));
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+
+        // wait for the results
+        auto all_results = rd.wait_for_all(req.should_stop);
+
+        // collect results
+        if (all_results.is_terminated) {
+            return res;
+        } else if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        } else {
+            for (auto & result : all_results.results) {
+                GGML_ASSERT(dynamic_cast<server_task_result_classify*>(result.get()) != nullptr);
+                responses.push_back(result->to_json());
+            }
+        }
+
+        // write JSON response
+        json root = format_response_classify(body, meta->model_name, responses);
         res->ok(root);
         return res;
     };

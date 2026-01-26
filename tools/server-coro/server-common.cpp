@@ -1378,6 +1378,34 @@ json format_response_rerank(
     return res;
 }
 
+json format_response_classify(
+        const json & request,
+        const std::string & model_name,
+        const json & predictions) {
+    int32_t n_tokens = 0;
+    json results = json::array();
+
+    for (const auto & pred : predictions) {
+        n_tokens += json_value(pred, "tokens_evaluated", 0);
+        results.push_back(pred.at("predictions"));
+    }
+
+    // For single input, unwrap the array
+    if (results.size() == 1) {
+        results = results[0];
+    }
+
+    return json{
+        {"model", json_value(request, "model", model_name)},
+        {"object", "list"},
+        {"usage", json{
+            {"prompt_tokens", n_tokens},
+            {"total_tokens", n_tokens}
+        }},
+        {"predictions", results}
+    };
+}
+
 
 //
 // other utils

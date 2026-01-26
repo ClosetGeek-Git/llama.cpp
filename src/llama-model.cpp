@@ -878,6 +878,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 hparams.f_max_alibi_bias = 8.0f;
             } break;
         case LLM_ARCH_BERT:
+        case LLM_ARCH_DISTILBERT:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,    hparams.f_norm_eps);
                 ml.get_key(LLM_KV_ATTENTION_CAUSAL,           hparams.causal_attn);
@@ -887,7 +888,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 3:
                         type = LLM_TYPE_17M; break; // bge-micro
                     case 6:
-                        type = LLM_TYPE_22M; break; // MiniLM-L6
+                        type = LLM_TYPE_22M; break; // MiniLM-L6, distilbert-base
                     case 12:
                         switch (hparams.n_embd) {
                             case 384: type = LLM_TYPE_33M; break; // MiniLM-L12, bge-small
@@ -3417,6 +3418,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     }
                 } break;
             case LLM_ARCH_BERT:
+            case LLM_ARCH_DISTILBERT:
             case LLM_ARCH_NOMIC_BERT:
             case LLM_ARCH_NOMIC_BERT_MOE:
             case LLM_ARCH_JINA_BERT_V3:
@@ -3424,7 +3426,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     tok_embd     = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
                     type_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_TYPES, "weight"), {n_embd, n_token_types}, TENSOR_NOT_REQUIRED);
 
-                    if (arch == LLM_ARCH_BERT) {
+                    if (arch == LLM_ARCH_BERT || arch == LLM_ARCH_DISTILBERT) {
                         pos_embd = create_tensor(tn(LLM_TENSOR_POS_EMBD,    "weight"), {n_embd, n_ctx_train}, 0);
 
                         cls   = create_tensor(tn(LLM_TENSOR_CLS, "weight"), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);
@@ -8083,6 +8085,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // Models that need specific instantiation should be handled in the
         // switch statement
         case LLM_ARCH_BERT:
+        case LLM_ARCH_DISTILBERT:
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_JINA_BERT_V3:
         case LLM_ARCH_NOMIC_BERT:
@@ -8270,6 +8273,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
                 llm = std::make_unique<llm_build_refact>(*this, params);
             } break;
         case LLM_ARCH_BERT:
+        case LLM_ARCH_DISTILBERT:
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_JINA_BERT_V3:
         case LLM_ARCH_NOMIC_BERT:
@@ -8895,6 +8899,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GROK:
         case LLM_ARCH_DBRX:
         case LLM_ARCH_BERT:
+        case LLM_ARCH_DISTILBERT:
         case LLM_ARCH_JINA_BERT_V3:
         case LLM_ARCH_MODERN_BERT:
         case LLM_ARCH_NOMIC_BERT:

@@ -24,7 +24,7 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
         ggml_tensor * type_row0 = ggml_view_1d(ctx0, model.type_embd, n_embd, 0);
         inpL                    = ggml_add(ctx0, inpL, type_row0);
     }
-    if (model.arch == LLM_ARCH_BERT) {
+    if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_DISTILBERT) {
         inpL = ggml_add(ctx0, ggml_get_rows(ctx0, model.pos_embd, inp_pos), inpL);
     }
     cb(inpL, "inp_embd", -1);
@@ -133,8 +133,8 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
                                 model.layers[il].ffn_down_exps, nullptr, hparams.n_expert, hparams.n_expert_used,
                                 LLM_FFN_GELU, false, false, 0.0f, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
             cb(cur, "ffn_moe_out", il);
-        } else if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_NOMIC_BERT_MOE ||
-                   model.arch == LLM_ARCH_JINA_BERT_V3) {
+        } else if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_DISTILBERT ||
+                   model.arch == LLM_ARCH_NOMIC_BERT_MOE || model.arch == LLM_ARCH_JINA_BERT_V3) {
             cur = build_ffn(cur,
                     model.layers[il].ffn_up, model.layers[il].ffn_up_b, NULL,
                     NULL, NULL, NULL,

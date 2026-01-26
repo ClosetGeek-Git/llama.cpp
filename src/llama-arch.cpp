@@ -20,6 +20,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_STARCODER,        "starcoder"        },
     { LLM_ARCH_REFACT,           "refact"           },
     { LLM_ARCH_BERT,             "bert"             },
+    { LLM_ARCH_DISTILBERT,       "distilbert"       },
     { LLM_ARCH_MODERN_BERT,      "modern-bert"      },
     { LLM_ARCH_NOMIC_BERT,       "nomic-bert"       },
     { LLM_ARCH_NOMIC_BERT_MOE,   "nomic-bert-moe"   },
@@ -756,6 +757,24 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
                 LLM_TENSOR_FFN_UP,
             };
         case LLM_ARCH_BERT:
+            return {
+                LLM_TENSOR_TOKEN_EMBD,
+                LLM_TENSOR_TOKEN_EMBD_NORM,
+                LLM_TENSOR_TOKEN_TYPES,
+                LLM_TENSOR_POS_EMBD,
+                LLM_TENSOR_ATTN_OUT_NORM,
+                LLM_TENSOR_ATTN_QKV,
+                LLM_TENSOR_ATTN_Q,
+                LLM_TENSOR_ATTN_K,
+                LLM_TENSOR_ATTN_V,
+                LLM_TENSOR_ATTN_OUT,
+                LLM_TENSOR_LAYER_OUT_NORM,
+                LLM_TENSOR_FFN_DOWN,
+                LLM_TENSOR_FFN_UP,
+                LLM_TENSOR_CLS,
+                LLM_TENSOR_CLS_OUT,
+            };
+        case LLM_ARCH_DISTILBERT:
             return {
                 LLM_TENSOR_TOKEN_EMBD,
                 LLM_TENSOR_TOKEN_EMBD_NORM,

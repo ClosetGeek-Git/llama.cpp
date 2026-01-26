@@ -2486,7 +2486,12 @@ void llm_graph_context::build_pooling(
                     if (cls_b) {
                         cur = ggml_add(ctx0, cur, cls_b);
                     }
-                    cur = ggml_tanh(ctx0, cur);
+                    // DistilBERT uses ReLU, other BERT variants use tanh
+                    if (arch == LLM_ARCH_DISTILBERT) {
+                        cur = ggml_relu(ctx0, cur);
+                    } else {
+                        cur = ggml_tanh(ctx0, cur);
+                    }
                 }
 
                 // some models don't have `cls_out`, for example: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
