@@ -1239,6 +1239,11 @@ class TensorNameMap:
 
         MODEL_TENSOR.CLS_OUT: (
             "classifier.out_proj", # roberta
+            "classifier",          # modern-bert
+        ),
+
+        MODEL_TENSOR.CLS_NORM: (
+            "head.norm",        # modern-bert
         ),
         #############################################################################
 

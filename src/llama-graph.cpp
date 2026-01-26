@@ -185,7 +185,9 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
-    if (cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN) {
+    // Also include RANK pooling since ModernBERT uses mean pooling within RANK mode
+    if (cparams.embeddings && (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
+                               cparams.pooling_type == LLAMA_POOLING_TYPE_RANK)) {
         const int64_t n_tokens     = ubatch->n_tokens;
         const int64_t n_seq_tokens = ubatch->n_seq_tokens;
         const int64_t n_seqs_unq   = ubatch->n_seqs_unq;
@@ -2437,7 +2439,8 @@ void llm_graph_context::build_pooling(
         ggml_tensor * cls,
         ggml_tensor * cls_b,
         ggml_tensor * cls_out,
-        ggml_tensor * cls_out_b) const {
+        ggml_tensor * cls_out_b,
+        ggml_tensor * cls_norm) const {
     if (!cparams.embeddings) {
         return;
     }
@@ -2476,8 +2479,14 @@ void llm_graph_context::build_pooling(
             } break;
         case LLAMA_POOLING_TYPE_RANK:
             {
-                ggml_tensor * inp_cls = build_inp_cls();
-                cur = ggml_get_rows(ctx0, inp, inp_cls);
+                // ModernBERT uses mean pooling for classification
+                if (arch == LLM_ARCH_MODERN_BERT) {
+                    ggml_tensor * inp_mean = build_inp_mean();
+                    cur = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, inp)), inp_mean);
+                } else {
+                    ggml_tensor * inp_cls = build_inp_cls();
+                    cur = ggml_get_rows(ctx0, inp, inp_cls);
+                }
 
                 // classification head
                 // https://github.com/huggingface/transformers/blob/5af7d41e49bbfc8319f462eb45253dcb3863dfb7/src/transformers/models/roberta/modeling_roberta.py#L1566
@@ -2486,9 +2495,16 @@ void llm_graph_context::build_pooling(
                     if (cls_b) {
                         cur = ggml_add(ctx0, cur, cls_b);
                     }
-                    // DistilBERT uses ReLU, other BERT variants use tanh
+                    // DistilBERT uses ReLU, ModernBERT uses GELU (erf), other BERT variants use tanh
                     if (arch == LLM_ARCH_DISTILBERT) {
                         cur = ggml_relu(ctx0, cur);
+                    } else if (arch == LLM_ARCH_MODERN_BERT) {
+                        cur = ggml_gelu_erf(ctx0, cur);
+                        // ModernBERT has LayerNorm after GELU
+                        if (cls_norm) {
+                            cur = ggml_norm(ctx0, cur, hparams.f_norm_eps);
+                            cur = ggml_mul(ctx0, cur, cls_norm);
+                        }
                     } else {
                         cur = ggml_tanh(ctx0, cur);
                     }
