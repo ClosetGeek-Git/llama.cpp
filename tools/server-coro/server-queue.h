@@ -14,6 +14,59 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+// Forward declaration for Swoole Pipe
+namespace swoole {
+    class Pipe;
+}
+
+// Debug logging for coroutine integration - enabled by LLAMA_CORO_DEBUG_JSON env var
+inline bool coro_debug_enabled() {
+    static std::atomic<int> cached{-1};
+    int val = cached.load(std::memory_order_acquire);
+    if (val < 0) {
+        const char* env = getenv("LLAMA_CORO_DEBUG_JSON");
+        val = (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0)) ? 1 : 0;
+        cached.store(val, std::memory_order_release);
+    }
+    return val == 1;
+}
+
+// Timing debug - enabled by LLAMA_TIMING_DEBUG env var
+// Outputs microsecond timestamps at all synchronization points
+inline bool timing_debug_enabled() {
+    static std::atomic<int> cached{-1};
+    int val = cached.load(std::memory_order_acquire);
+    if (val < 0) {
+        const char* env = getenv("LLAMA_TIMING_DEBUG");
+        val = (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0)) ? 1 : 0;
+        cached.store(val, std::memory_order_release);
+    }
+    return val == 1;
+}
+
+#include <sys/syscall.h>
+#include <nlohmann/json.hpp>
+
+inline pid_t get_tid() {
+    return syscall(SYS_gettid);
+}
+
+// Timing log function - outputs proper JSON using nlohmann::json
+inline void timing_log(const char* event, int task_id, nlohmann::ordered_json extra = {}) {
+    if (!timing_debug_enabled()) return;
+    nlohmann::ordered_json j;
+    j["timing"] = true;
+    j["tid"] = get_tid();
+    j["task"] = task_id;
+    j["event"] = event;
+    j["ts_us"] = ggml_time_us();
+    for (auto& [k, v] : extra.items()) {
+        j[k] = v;
+    }
+    fprintf(stderr, "%s\n", j.dump().c_str());
+    fflush(stderr);
+}
+
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
 struct server_queue {
@@ -130,17 +183,17 @@ private:
     std::mutex mutex_results;
     std::condition_variable condition_results;
 
-    // eventfd registration for coroutine-based waiting
-    // maps task_id -> eventfd (dedicated lock for cross-thread access from decode thread)
-    std::unordered_map<int, int> task_to_eventfd;
-    std::mutex mutex_eventfd;
+    // Pipe-based notification for coroutine-yielding wait
+    // maps task_id -> pipe write fd (dedicated lock for cross-thread access from decode thread)
+    std::unordered_map<int, int> task_to_pipe_fd;
+    std::mutex mutex_pipe;  // Mutex for cross-thread pipe writes
 
 public:
-    // Register an eventfd for a task to enable coroutine-yielding wait
-    void register_eventfd(int id_task, int efd);
+    // Register a pipe write fd for a task to enable coroutine-yielding wait
+    void register_pipe(int id_task, int pipe_write_fd);
 
-    // Unregister eventfd when task is done or cancelled
-    void unregister_eventfd(int id_task);
+    // Unregister pipe when task is done or cancelled
+    void unregister_pipe(int id_task);
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task);
 
@@ -193,30 +246,18 @@ struct server_response_reader {
     // Holds shared shutdown flag to detect when queue is destroyed (avoids use-after-free in stop())
     std::shared_ptr<std::atomic<bool>> shutdown_flag;
 
-    // eventfd for coroutine-yielding wait (signaled by decode thread when results ready)
-    int event_fd = -1;
+    // Pipe for cross-thread notification (decode thread writes, coroutine waits)
+    swoole::Pipe* pipe = nullptr;              // Per-reader pipe for notification
+    int pipe_read_fd = -1;                     // Cached pipe read fd for swoole_coroutine_socket_wait_event
 
     // tracking generation state and partial tool calls
     // only used by streaming completions
     std::vector<task_result_state> states;
 
     // should_stop function will be called each polling_interval_seconds
-    // TODO: timeout support via poll() on event_fd needs to be implemented
-    server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
-        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds),
-          shutdown_flag(queue_results.get_shutdown_flag()) {
-        event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (event_fd < 0) {
-            LOG_WRN("eventfd creation failed, falling back to polling mode: %s\n", strerror(errno));
-        }
-    }
-    ~server_response_reader() {
-        stop();
-        if (event_fd >= 0) {
-            close(event_fd);
-            event_fd = -1;
-        }
-    }
+    // Constructor and destructor implemented in .cpp file (needs Swoole includes)
+    server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds);
+    ~server_response_reader();
 
     int get_new_id() {
         return queue_tasks.get_new_id();

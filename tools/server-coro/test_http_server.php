@@ -26,7 +26,7 @@ Co::set(['hook_flags' => SWOOLE_HOOK_ALL]);
 
 // Server configuration
 const SERVER_HOST = '0.0.0.0';
-const SERVER_PORT = 9501;
+const SERVER_PORT = 8000;
 const PUBLIC_DIR = __DIR__ . '/public';
 
 /**
@@ -116,7 +116,7 @@ function handle_api_request(Request $request, Response $response): void
         return;
     }
     
-    if (swoole_llama_ready() !== 1) {
+    if (swoole_llama_model_ready('Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M') !== 1) {
         $response->header('Content-Type', 'application/json');
         $response->status(503);
         $response->end('{"error":{"message":"Model loading","code":503}}');
@@ -145,7 +145,7 @@ function handle_health(Request $request, Response $response): void
 {
     add_cors_headers($response);
     $response->header('Content-Type', 'application/json');
-    $ready = swoole_llama_ready();
+    $ready = swoole_llama_model_ready('Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M');
     
     if ($ready === 0) {
         $response->status(503);
@@ -176,7 +176,7 @@ function create_server(): Server
         $response->end(json_encode([
             'default_generation_settings' => [
                 'n_ctx' => 4096,
-                'model' => basename($GLOBALS['argv'][array_search('-m', $GLOBALS['argv']) + 1] ?? 'model'),
+                'model' => 'Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M',
             ],
             'total_slots' => 4,
             'chat_template' => 'chatml',
@@ -225,21 +225,22 @@ function create_server(): Server
 // Main entry point
 Co\run(function () use ($argv) {
     echo "=== Llama PHP HTTP Server ===\n";
+    $start = microtime(true);
     
-    if (!swoole_llama_init($argv)) {
-        echo "ERROR: Failed to initialize llama\n";
+    echo "1. Loading model 'Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M'...\n";
+    if (!swoole_llama_load_model(['test', '-m', '/home/jason-dev/swoole/Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M.gguf', '--ctx-size', '16048', '--parallel', '4', '--reasoning-budget', '0', '--chat-template-file', '/home/jason-dev/swoole/llama.cpp/models/templates/Qwen-Qwen3-0.6B.jinja', '--log-disable'])) {
+        echo "   FAILED: swoole_llama_load_model() returned false\n";
         return;
     }
+    echo "   OK: Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M loading started\n";
     
-    echo "Loading model...\n";
-    $start = microtime(true);
-    while (swoole_llama_ready() === 0) {
-        Co::sleep(0.1);
+    // Test 2: Wait for Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M to be ready
+    echo "2. Waiting for 'Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M' to be ready...\n";
+    while (swoole_llama_model_ready('Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M') === 0) {
+        \Co::sleep(0.1);
     }
-    
-    if (swoole_llama_ready() === -1) {
-        echo "ERROR: Model failed to load\n";
-        swoole_llama_shutdown();
+    if (swoole_llama_model_ready('Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M') === -1) {
+        echo "   FAILED: Josiefied-Qwen3-4B-abliterated-v2.Q4_K_M failed to load\n";
         return;
     }
     
@@ -258,9 +259,9 @@ Co\run(function () use ($argv) {
         echo "Done.\n";
     };
     
-    pcntl_async_signals(true);
-    pcntl_signal(SIGINT, $shutdown);
-    pcntl_signal(SIGTERM, $shutdown);
+    //pcntl_async_signals(true);
+    //pcntl_signal(SIGINT, $shutdown);
+    //pcntl_signal(SIGTERM, $shutdown);
     
     echo "Listening on http://" . SERVER_HOST . ":" . SERVER_PORT . "\n";
     echo "WebUI: http://localhost:" . SERVER_PORT . "/\n";

@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "log.h"
 #include "server-common.h"
+#include "server-queue.h"
 
 #include <atomic>
 #include <memory>
@@ -618,7 +619,9 @@ static PHP_METHOD(LlamaRequest, __construct)
     }
 
     // Invoke handler with the persistent request reference
-    PHP_DBG(req_id, "invoking handler...");
+    int64_t handler_start_us = ggml_time_us();
+    timing_log("HANDLER_INVOKE_ENTER", req_id, {{"path", intern->request.path}});
+    PHP_DBG(req_id, "invoking handler... timestamp_us=%lld", (long long)handler_start_us);
     try {
         intern->response = (*handler)(intern->request);
     } catch (const std::exception &e) {
@@ -631,7 +634,9 @@ static PHP_METHOD(LlamaRequest, __construct)
         intern->is_stream = false;
         return;
     }
-    PHP_DBG(req_id, "handler returned");
+    int64_t handler_end_us = ggml_time_us();
+    timing_log("HANDLER_INVOKE_EXIT", req_id, {{"duration_us", handler_end_us - handler_start_us}});
+    PHP_DBG(req_id, "handler returned: elapsed_us=%lld timestamp_us=%lld", (long long)(handler_end_us - handler_start_us), (long long)handler_end_us);
 
     if (!intern->response) {
         PHP_DBG(req_id, "ERROR: handler returned null response");

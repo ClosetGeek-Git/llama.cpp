@@ -34,6 +34,7 @@ phpize
 
 # Build
 make -j6
+sudo -S <<< "0911" make install
 
 echo ""
 echo "=== Build complete ==="

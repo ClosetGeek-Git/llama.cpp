@@ -3,9 +3,11 @@
 
 #include "log.h"
 
-// Swoole headers for coroutine-aware eventfd waiting
+// Swoole headers for coroutine-aware waiting
 #include "swoole.h"
+#include "swoole_coroutine.h"
 #include "swoole_coroutine_api.h"
+#include "swoole_pipe.h"
 
 #include <atomic>
 #include <chrono>
@@ -23,29 +25,31 @@
 #define RES_ERR(fmt, ...) LOG_ERR("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define RES_DBG(fmt, ...) LOG_DBG("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 
-// Coroutine debug logging - enabled by LLAMA_CORO_DEBUG_JSON env var
-// Using atomic for thread-safe initialization
-static std::atomic<int> g_coro_debug_enabled{-1};
-
-static bool coro_debug_enabled() {
-    int val = g_coro_debug_enabled.load(std::memory_order_acquire);
-    if (val < 0) {
-        const char* env = getenv("LLAMA_CORO_DEBUG_JSON");
-        val = (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0)) ? 1 : 0;
-        g_coro_debug_enabled.store(val, std::memory_order_release);
-    }
-    return val == 1;
-}
-
+// Coroutine debug macro - uses coro_debug_enabled() from server-queue.h
 #define CORO_DBG(fmt, ...) \
     do { if (coro_debug_enabled()) { fprintf(stderr, "[CORO_DBG] %s: " fmt "\n", __func__, ##__VA_ARGS__); fflush(stderr); } } while(0)
+
+// Yield to event loop using defer+yield pattern.
+// Unlike swoole_coroutine_usleep(1), this works correctly when other coroutines
+// are blocked on swoole_coroutine_socket_wait_event() because adding a defer task
+// causes epoll_wait timeout to become 0, allowing immediate return.
+static void coroutine_reschedule() {
+    auto *co = swoole::Coroutine::get_current();
+    if (!co) return;
+    swoole_event_defer([](void *arg) {
+        static_cast<swoole::Coroutine*>(arg)->resume();
+    }, co);
+    co->yield();
+}
 
 //
 // server_queue
 //
 
 int server_queue::post(server_task && task, bool front) {
+    timing_log("QUEUE_POST_ENTER", task.id, {{"front", front}});
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    timing_log("QUEUE_POST_LOCKED", task.id);
     GGML_ASSERT(task.id != -1);
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
@@ -60,6 +64,7 @@ int server_queue::post(server_task && task, bool front) {
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
+    timing_log("QUEUE_POST_EXIT", task_id);
     return task_id;
 }
 
@@ -165,6 +170,15 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     while (true) {
         QUE_DBG("%s", "processing new tasks\n");
 
+        int tasks_drained = 0;
+        int64_t drain_start_us = ggml_time_us();
+        size_t queue_size_at_start = 0;
+        {
+            std::unique_lock<std::mutex> lock(mutex_tasks);
+            queue_size_at_start = queue_tasks.size();
+        }
+        CORO_DBG("start_loop: CYCLE_START queue_size=%zu timestamp_us=%lld", queue_size_at_start, (long long)drain_start_us);
+
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running) {
@@ -178,20 +192,29 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             }
             server_task task = std::move(queue_tasks.front());
             queue_tasks.pop_front();
+            size_t remaining = queue_tasks.size();
             lock.unlock();
+            tasks_drained++;
 
-            CORO_DBG("start_loop: processing task id=%d type=%d", task.id, (int)task.type);
+            timing_log("TASK_PICKUP", task.id, {{"remaining", remaining}, {"task_type", (int)task.type}});
+            CORO_DBG("start_loop: processing task id=%d type=%d (drained=%d remaining=%zu)", task.id, (int)task.type, tasks_drained, remaining);
             QUE_DBG("processing task, id = %d\n", task.id);
             callback_new_task(std::move(task));
             CORO_DBG("start_loop: task id=%d processed", task.id);
         }
+        int64_t drain_end_us = ggml_time_us();
+        CORO_DBG("start_loop: DRAIN_COMPLETE tasks_drained=%d drain_time_us=%lld", tasks_drained, (long long)(drain_end_us - drain_start_us));
         // all tasks in the current loop is processed, slots data is now ready
         CORO_DBG("start_loop: calling update_slots");
         QUE_DBG("%s", "update slots\n");
 
         // this will run the main inference process for all slots
+        int64_t update_slots_start_us = ggml_time_us();
+        timing_log("UPDATE_SLOTS_ENTER", -1, {{"tasks_drained", tasks_drained}});
         callback_update_slots();
-        CORO_DBG("start_loop: update_slots returned");
+        int64_t update_slots_end_us = ggml_time_us();
+        timing_log("UPDATE_SLOTS_EXIT", -1, {{"duration_us", update_slots_end_us - update_slots_start_us}});
+        CORO_DBG("start_loop: update_slots returned (took %lld us)", (long long)(update_slots_end_us - update_slots_start_us));
         {
             // update_slots() may take a while to finish, we need to make sure it's not counted as idle
             std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -257,16 +280,16 @@ void server_queue::cleanup_pending_task(int id_target) {
 // server_response
 //
 
-void server_response::register_eventfd(int id_task, int efd) {
-    std::unique_lock<std::mutex> lock(mutex_eventfd);
-    task_to_eventfd[id_task] = efd;
-    RES_DBG("registered eventfd %d for task %d\n", efd, id_task);
+void server_response::register_pipe(int id_task, int pipe_write_fd) {
+    std::unique_lock<std::mutex> lock(mutex_pipe);
+    task_to_pipe_fd[id_task] = pipe_write_fd;
+    RES_DBG("registered pipe fd %d for task %d\n", pipe_write_fd, id_task);
 }
 
-void server_response::unregister_eventfd(int id_task) {
-    std::unique_lock<std::mutex> lock(mutex_eventfd);
-    task_to_eventfd.erase(id_task);
-    RES_DBG("unregistered eventfd for task %d\n", id_task);
+void server_response::unregister_pipe(int id_task) {
+    std::unique_lock<std::mutex> lock(mutex_pipe);
+    task_to_pipe_fd.erase(id_task);
+    RES_DBG("unregistered pipe for task %d\n", id_task);
 }
 
 void server_response::add_waiting_task_id(int id_task) {
@@ -368,12 +391,14 @@ server_task_result_ptr server_response::recv(int id_task) {
 
 void server_response::send(server_task_result_ptr && result) {
     RES_DBG("sending result for task id = %d\n", result->id);
+    timing_log("SEND_ENTER", result->id, {{"is_stop", result->is_stop()}, {"is_error", result->is_error()}});
     CORO_DBG("ENTER: result id=%d is_stop=%d is_error=%d", result->id, result->is_stop(), result->is_error());
 
     int result_id = result->id;
 
     {
         std::unique_lock<std::mutex> lock(mutex_results);
+        timing_log("SEND_LOCKED_RESULTS", result_id);
         CORO_DBG("checking waiting_task_ids, size=%zu", waiting_task_ids.size());
         bool found = false;
         for (const auto & id_task : waiting_task_ids) {
@@ -392,22 +417,31 @@ void server_response::send(server_task_result_ptr && result) {
         }
     }
 
-    // Signal eventfd to wake coroutine (outside of mutex_results lock)
+    // Signal pipe to wake coroutine (outside of mutex_results lock)
+    // Write notification byte to pipe - coroutine will wake via swoole_coroutine_socket_wait_event
     {
-        std::unique_lock<std::mutex> lock(mutex_eventfd);
-        auto it = task_to_eventfd.find(result_id);
-        if (it != task_to_eventfd.end()) {
-            CORO_DBG("signaling eventfd %d for task %d", it->second, result_id);
-            uint64_t val = 1;
-            ssize_t r = write(it->second, &val, sizeof(val));
+        int64_t mutex_start_us = ggml_time_us();
+        std::unique_lock<std::mutex> lock(mutex_pipe);
+        int64_t mutex_end_us = ggml_time_us();
+        timing_log("SEND_PIPE_MUTEX", result_id, {{"wait_us", mutex_end_us - mutex_start_us}});
+        
+        auto it = task_to_pipe_fd.find(result_id);
+        if (it != task_to_pipe_fd.end()) {
+            timing_log("SEND_PIPE_WRITE", result_id, {{"fd", it->second}});
+            CORO_DBG("writing notification to pipe fd %d for task %d", it->second, result_id);
+            // Write a simple notification byte - the result is already in queue_results
+            uint8_t notify = 1;
+            ssize_t r = write(it->second, &notify, sizeof(notify));
             if (r < 0) {
-                RES_WRN("failed to signal eventfd for task %d: %s\n", result_id, strerror(errno));
+                RES_WRN("failed to write to pipe for task %d: %s\n", result_id, strerror(errno));
             } else {
-                RES_DBG("signaled eventfd for task %d\n", result_id);
-                CORO_DBG("eventfd signal write successful for task %d", result_id);
+                RES_DBG("wrote notification to pipe for task %d\n", result_id);
+                timing_log("SEND_PIPE_WRITTEN", result_id);
+                CORO_DBG("pipe write successful for task %d", result_id);
             }
         } else {
-            CORO_DBG("NO eventfd registered for task %d (map size=%zu)", result_id, task_to_eventfd.size());
+            timing_log("SEND_NO_PIPE", result_id, {{"map_size", task_to_pipe_fd.size()}});
+            CORO_DBG("NO pipe registered for task %d (map size=%zu)", result_id, task_to_pipe_fd.size());
         }
     }
 }
@@ -421,14 +455,14 @@ void server_response::terminate() {
     running = false;
     condition_results.notify_all();
 
-    // Signal all registered eventfds to wake up blocked coroutines
+    // Signal all registered pipes to wake up blocked coroutines
     {
-        std::unique_lock<std::mutex> lock(mutex_eventfd);
-        for (const auto & pair : task_to_eventfd) {
-            uint64_t val = 1;
-            ssize_t r = write(pair.second, &val, sizeof(val));
+        std::unique_lock<std::mutex> lock(mutex_pipe);
+        for (const auto & pair : task_to_pipe_fd) {
+            uint8_t notify = 1;
+            ssize_t r = write(pair.second, &notify, sizeof(notify));
             if (r < 0) {
-                RES_WRN("failed to signal eventfd during terminate for task %d: %s\n", pair.first, strerror(errno));
+                RES_WRN("failed to write to pipe during terminate for task %d: %s\n", pair.first, strerror(errno));
             }
         }
     }
@@ -438,35 +472,78 @@ void server_response::terminate() {
 // server_response_reader
 //
 
+// Pipe-based notification: decode thread writes to pipe, coroutine waits via swoole_coroutine_socket_wait_event
+
+server_response_reader::server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
+    : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds),
+      shutdown_flag(queue_results.get_shutdown_flag()) {
+    
+    // Create pipe for cross-thread notification (decode thread -> coroutine)
+    pipe = new swoole::Pipe(false);  // non-blocking
+    if (!pipe->ready()) {
+        LOG_WRN("Pipe creation failed, falling back to polling mode\n");
+        delete pipe;
+        pipe = nullptr;
+    }
+    
+    if (pipe) {
+        // Get the pipe read fd for swoole_coroutine_socket_wait_event
+        auto* read_socket = pipe->get_socket(false);  // false = worker/read side
+        if (read_socket) {
+            pipe_read_fd = read_socket->get_fd();
+            LOG_DBG("Pipe created for reader: read_fd=%d, write_fd=%d\n", 
+                    pipe_read_fd, pipe->get_socket(true)->get_fd());
+        }
+    }
+}
+
+server_response_reader::~server_response_reader() {
+    stop();
+    
+    if (pipe) {
+        delete pipe;
+        pipe = nullptr;
+        pipe_read_fd = -1;
+    }
+}
+
 void server_response_reader::post_task(server_task && task, bool front) {
     GGML_ASSERT(id_tasks.empty() && "post_task() can only be called once per reader");
     GGML_ASSERT(!task.is_parent() && "not supported, use post_tasks() instead");
     
     int task_id = task.id;
-    CORO_DBG("ENTER: task_id=%d front=%d event_fd=%d", task_id, front, event_fd);
+    int pipe_write_fd = pipe ? pipe->get_socket(true)->get_fd() : -1;
+    timing_log("POST_TASK_ENTER", task_id, {{"front", front}, {"pipe_fd", pipe_write_fd}});
+    CORO_DBG("ENTER: task_id=%d front=%d pipe_fd=%d", task_id, front, pipe_write_fd);
     
     task.index = 0;
     id_tasks.insert(task.id);
     states.push_back(task.create_state());
     queue_results.add_waiting_task_id(task.id);
-    // Register eventfd for coroutine-yielding wait
-    if (event_fd >= 0) {
-        queue_results.register_eventfd(task.id, event_fd);
+    // Register pipe for coroutine-yielding wait
+    if (pipe_write_fd >= 0) {
+        queue_results.register_pipe(task.id, pipe_write_fd);
     }
     CORO_DBG("task_id=%d: posting to queue...", task_id);
+    timing_log("POST_TASK_QUEUE_POST", task_id);
     queue_tasks.post(std::move(task), front);
 
     // Yield to let other coroutines post their tasks before we wait for results
     // This enables batching of concurrent requests
-    CORO_DBG("task_id=%d: yielding coroutine (swoole_coroutine_usleep)...", task_id);
-    swoole_coroutine_usleep(1);
+    timing_log("POST_TASK_YIELD_ENTER", task_id);
+    CORO_DBG("task_id=%d: yielding coroutine (coroutine_reschedule)...", task_id);
+    coroutine_reschedule();
+    timing_log("POST_TASK_YIELD_EXIT", task_id);
     CORO_DBG("task_id=%d: EXIT after yield", task_id);
 }
 
 void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool front) {
     GGML_ASSERT(id_tasks.empty() && "post_tasks() can only be called once per reader");
     
-    CORO_DBG("ENTER: num_tasks=%zu front=%d event_fd=%d", tasks.size(), front, event_fd);
+    int first_task_id = tasks.empty() ? -1 : tasks[0].id;
+    int pipe_write_fd = pipe ? pipe->get_socket(true)->get_fd() : -1;
+    timing_log("POST_TASKS_ENTER", first_task_id, {{"num_tasks", tasks.size()}, {"front", front}, {"pipe_fd", pipe_write_fd}});
+    CORO_DBG("ENTER: num_tasks=%zu front=%d pipe_fd=%d", tasks.size(), front, pipe_write_fd);
     
     id_tasks = server_task::get_list_id(tasks);
     states.reserve(tasks.size());
@@ -482,19 +559,22 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool 
     }
     GGML_ASSERT(states.size() == id_tasks.size());
     queue_results.add_waiting_task_ids(id_tasks);
-    // Register eventfd for coroutine-yielding wait
-    if (event_fd >= 0) {
+    // Register pipe for coroutine-yielding wait
+    if (pipe_write_fd >= 0) {
         for (const auto & id_task : id_tasks) {
-            queue_results.register_eventfd(id_task, event_fd);
+            queue_results.register_pipe(id_task, pipe_write_fd);
         }
     }
     CORO_DBG("posting %zu tasks to queue...", tasks.size());
+    timing_log("POST_TASKS_QUEUE_POST", first_task_id, {{"num_tasks", id_tasks.size()}});
     queue_tasks.post(std::move(tasks), front);
 
     // Yield to let other coroutines post their tasks before we wait for results
     // This enables batching of concurrent requests
-    CORO_DBG("yielding coroutine (swoole_coroutine_usleep)...");
-    swoole_coroutine_usleep(1);
+    timing_log("POST_TASKS_YIELD_ENTER", first_task_id);
+    CORO_DBG("yielding coroutine (coroutine_reschedule)...");
+    coroutine_reschedule();
+    timing_log("POST_TASKS_YIELD_EXIT", first_task_id);
     CORO_DBG("EXIT after yield");
 }
 
@@ -505,7 +585,10 @@ bool server_response_reader::has_next() const {
 // return nullptr if should_stop() is true before receiving a result
 // note: if one error is received, it will stop further processing and return error result
 server_task_result_ptr server_response_reader::next(const std::function<bool()> & should_stop) {
-    CORO_DBG("ENTER: num_id_tasks=%zu event_fd=%d", id_tasks.size(), event_fd);
+    int first_task_id = id_tasks.empty() ? -1 : *id_tasks.begin();
+    bool has_pipe = (pipe_read_fd >= 0);
+    timing_log("NEXT_ENTER", first_task_id, {{"num_id_tasks", id_tasks.size()}, {"has_pipe", has_pipe}, {"pipe_read_fd", pipe_read_fd}});
+    CORO_DBG("ENTER: num_id_tasks=%zu has_pipe=%d pipe_read_fd=%d", id_tasks.size(), has_pipe, pipe_read_fd);
     int loop_count = 0;
     
     while (true) {
@@ -513,12 +596,14 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
         
         // Check if the queue is shutting down
         if (!queue_results.is_running()) {
+            timing_log("NEXT_EXIT_SHUTDOWN", first_task_id);
             CORO_DBG("EXIT: queue is shutting down");
             SRV_DBG("%s", "queue is shutting down, returning nullptr\n");
             return nullptr;
         }
 
         // Try non-blocking fetch first
+        timing_log("NEXT_RECV_TRY", first_task_id, {{"loop", loop_count}});
         CORO_DBG("loop=%d: trying recv_with_timeout (non-blocking)...", loop_count);
         server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, 0);
         
@@ -527,49 +612,52 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             
             // No result yet, check stop condition
             if (should_stop()) {
+                timing_log("NEXT_EXIT_SHOULD_STOP", first_task_id);
                 CORO_DBG("EXIT: should_stop returned true");
                 SRV_DBG("%s", "stopping wait for next result due to should_stop condition\n");
                 return nullptr;
             }
             
-            // Yield coroutine by waiting on eventfd with Swoole's coroutine-aware API
-            if (event_fd >= 0) {
-                uint64_t val;
-                ssize_t r = read(event_fd, &val, sizeof(val));
+            // Yield coroutine by waiting on pipe read fd with Swoole's coroutine-aware API
+            if (pipe_read_fd >= 0) {
+                uint8_t buf[64];
+                ssize_t r = read(pipe_read_fd, buf, sizeof(buf));
                 if (r < 0) {
                     if (errno == EAGAIN) {
-                        // No data available - yield coroutine until eventfd becomes readable
+                        // No data available - yield coroutine until pipe becomes readable
                         // swoole_coroutine_socket_wait_event will suspend this coroutine
-                        // and resume it when the eventfd is signaled (written to)
-                        CORO_DBG("loop=%d: yielding coroutine (swoole_coroutine_socket_wait_event)...", loop_count);
-                        int wait_result = swoole_coroutine_socket_wait_event(event_fd, SW_EVENT_READ, -1);
+                        // and resume it when the pipe is signaled (written to)
+                        timing_log("NEXT_PIPE_WAIT_ENTER", first_task_id, {{"loop", loop_count}});
+                        CORO_DBG("loop=%d: yielding coroutine (swoole_coroutine_socket_wait_event on pipe)...", loop_count);
+                        int wait_result = swoole_coroutine_socket_wait_event(pipe_read_fd, SW_EVENT_READ, -1);
+                        timing_log("NEXT_PIPE_WAIT_EXIT", first_task_id, {{"loop", loop_count}, {"wait_result", wait_result}});
                         CORO_DBG("loop=%d: coroutine resumed, wait_result=%d", loop_count, wait_result);
                         if (wait_result < 0) {
                             // Wait failed - could be interrupted or fd closed
                             if (!queue_results.is_running()) {
-                                CORO_DBG("EXIT: queue stopped during eventfd wait");
-                                SRV_DBG("%s", "queue stopped during eventfd wait\n");
+                                CORO_DBG("EXIT: queue stopped during pipe wait");
+                                SRV_DBG("%s", "queue stopped during pipe wait\n");
                                 return nullptr;
                             }
                             // Otherwise just continue the loop to retry
                         }
-                        // After waking, try to drain the eventfd
-                        read(event_fd, &val, sizeof(val));
+                        // After waking, try to drain the pipe
+                        read(pipe_read_fd, buf, sizeof(buf));
                     } else {
-                        SRV_WRN("eventfd read error: %s\n", strerror(errno));
+                        SRV_WRN("pipe read error: %s\n", strerror(errno));
                     }
                 } else {
-                    CORO_DBG("loop=%d: eventfd had data, val=%lu", loop_count, (unsigned long)val);
+                    CORO_DBG("loop=%d: pipe had data, bytes=%ld", loop_count, (long)r);
                 }
                 // After waking, check if queue is still running
                 if (!queue_results.is_running()) {
-                    CORO_DBG("EXIT: queue stopped while waiting on eventfd");
-                    SRV_DBG("%s", "queue stopped while waiting on eventfd\n");
+                    CORO_DBG("EXIT: queue stopped while waiting on pipe");
+                    SRV_DBG("%s", "queue stopped while waiting on pipe\n");
                     return nullptr;
                 }
             } else {
                 // Fallback: use polling with condition_variable timeout
-                CORO_DBG("loop=%d: no eventfd, using polling fallback", loop_count);
+                CORO_DBG("loop=%d: no pipe, using polling fallback", loop_count);
                 result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
                 if (result == nullptr) {
                     continue; // timeout, loop to check should_stop
@@ -581,6 +669,7 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             int result_id = result->id;
             bool is_error = result->is_error();
             bool is_stop = result->is_stop();
+            timing_log("NEXT_RESULT_RECEIVED", result_id, {{"is_error", is_error}, {"is_stop", is_stop}, {"loop", loop_count}});
             CORO_DBG("loop=%d: got result id=%d is_error=%d is_stop=%d", loop_count, result_id, is_error, is_stop);
             
             if (is_error) {
@@ -637,14 +726,16 @@ void server_response_reader::stop() {
         return;
     }
 
-    // Unregister eventfd for all tasks
-    if (event_fd >= 0) {
+    // Unregister pipe for all tasks
+    int pipe_write_fd = pipe ? pipe->get_socket(true)->get_fd() : -1;
+    if (pipe_write_fd >= 0) {
         for (const auto & id_task : id_tasks) {
-            queue_results.unregister_eventfd(id_task);
+            queue_results.unregister_pipe(id_task);
         }
-        // Wake up any waiting coroutine so it can exit
-        uint64_t val = 1;
-        write(event_fd, &val, sizeof(val));
+        // Write to pipe to wake up any waiting coroutine
+        uint8_t buf = 1;
+        ssize_t w = write(pipe_write_fd, &buf, 1);
+        (void)w;
     }
 
     queue_results.remove_waiting_task_ids(id_tasks);

@@ -1752,6 +1752,19 @@ private:
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
+                    // Debug: log slot states before assignment
+                    if (coro_debug_enabled()) {
+                        std::string slot_states;
+                        for (size_t si = 0; si < slots.size(); si++) {
+                            if (si > 0) slot_states += ",";
+                            slot_states += "s" + std::to_string(si) + ":";
+                            slot_states += slots[si].is_processing() ? "busy" : "idle";
+                        }
+                        fprintf(stderr, "[CORO_DBG] process_new_task: task_id=%d slots=[%s] timestamp_us=%lld\n", 
+                                id_task, slot_states.c_str(), (long long)ggml_time_us());
+                        fflush(stderr);
+                    }
+
                     server_slot * slot = id_slot != -1
                                             ? get_slot_by_id(id_slot)
                                             : get_available_slot(task);
@@ -1787,9 +1800,16 @@ private:
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                    } else {
+                        if (coro_debug_enabled()) {
+                            fprintf(stderr, "[CORO_DBG] process_new_task: ASSIGNING task_id=%d to slot_id=%d timestamp_us=%lld\n",
+                                    id_task, slot->id, (long long)ggml_time_us());
+                            fflush(stderr);
+                        }
+                        if (!launch_slot_with_task(*slot, std::move(task))) {
+                            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                            break; // drop the task
+                        }
                     }
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
@@ -2111,6 +2131,19 @@ private:
     }
 
     void update_slots() {
+        int64_t update_slots_enter_us = ggml_time_us();
+        
+        // Count active slots for debug
+        int active_slot_count = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) active_slot_count++;
+        }
+        if (coro_debug_enabled()) {
+            fprintf(stderr, "[CORO_DBG] update_slots: ENTER active_slots=%d/%zu timestamp_us=%lld\n",
+                    active_slot_count, slots.size(), (long long)update_slots_enter_us);
+            fflush(stderr);
+        }
+
         // Process active test streams (no-op streaming for testing)
         // Each iteration sends one chunk, simulating real token generation
         for (auto it = active_test_streams.begin(); it != active_test_streams.end(); ) {
@@ -2154,7 +2187,10 @@ private:
 
             if (all_idle && active_test_streams.empty()) {
                 SRV_INF("%s", "all slots are idle\n");
-
+                if (coro_debug_enabled()) {
+                    fprintf(stderr, "[CORO_DBG] update_slots: EXIT_EARLY all_idle timestamp_us=%lld\n", (long long)ggml_time_us());
+                    fflush(stderr);
+                }
                 return;
             }
         }

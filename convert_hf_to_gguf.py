@@ -5684,8 +5684,7 @@ class BertModel(TextModel):
         self.vocab_size = None
 
         if cls_out_labels := self.hparams.get("id2label"):
-            first_label = cls_out_labels.get(0) or cls_out_labels.get("0")
-            if len(cls_out_labels) == 2 and first_label == "LABEL_0":
+            if len(cls_out_labels) == 2 and cls_out_labels[0] == "LABEL_0":
                 # Remove dummy labels added by AutoConfig
                 cls_out_labels = None
         self.cls_out_labels = cls_out_labels
@@ -5897,7 +5896,7 @@ class BertModel(TextModel):
 
 @ModelBase.register("DistilBertModel", "DistilBertForMaskedLM", "DistilBertForSequenceClassification")
 class DistilBertModel(BertModel):
-    model_arch = gguf.MODEL_ARCH.DISTILBERT
+    model_arch = gguf.MODEL_ARCH.BERT
 
     def set_gguf_parameters(self):
         self.gguf_writer.add_layer_norm_eps(1e-12)
@@ -10982,12 +10981,6 @@ class ModernBertModel(BertModel):
         self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.NONE)
         self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
 
-        # Set pooling type for classification models
-        # Use RANK to enable classification head (dense -> GELU -> LayerNorm -> classifier)
-        # The actual pooling method (mean vs cls) is handled in build_pooling() based on architecture
-        if self.hparams.get("classifier_pooling"):
-            self.gguf_writer.add_pooling_type(gguf.PoolingType.RANK)
-
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # these layers act as MLM head, so we don't need them
         if name.startswith("decoder."):
@@ -11956,3 +11949,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+    
