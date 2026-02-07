@@ -33,6 +33,12 @@ PHP_FUNCTION(swoole_llama_load_model);
 PHP_FUNCTION(swoole_llama_model_ready);
 PHP_FUNCTION(swoole_llama_unload_model);
 PHP_FUNCTION(swoole_llama_list_models);
+PHP_FUNCTION(swoole_llama_session_get);
+PHP_FUNCTION(swoole_llama_session_set);
+PHP_FUNCTION(swoole_llama_session_remove);
+PHP_FUNCTION(swoole_llama_session_list);
+PHP_FUNCTION(swoole_llama_session_save);
+PHP_FUNCTION(swoole_llama_session_restore);
 
 // Llama\Request class entry
 extern zend_class_entry *llama_request_ce;
@@ -50,6 +56,11 @@ extern zend_class_entry *llama_request_ce;
 #include <atomic>
 #include <memory>
 #include <thread>
+#include <string>
+#include <vector>
+
+// Forward declare ModelInstance (defined in coro-extension.cpp)
+struct ModelInstance;
 
 // Object storage for Llama\Request class
 struct LlamaRequestObject {
@@ -58,6 +69,15 @@ struct LlamaRequestObject {
     std::shared_ptr<std::atomic<bool>> cancelled;
     bool is_stream;
     int request_id;  // Debug tracking ID
+
+    // Session management fields
+    ModelInstance *session_model_inst = nullptr; // non-null if session is active
+    int session_id = -1;
+    int session_slot_id = -1;
+    bool session_update = false;
+    bool session_remove = false;
+    bool session_saved = false; // to avoid double-save
+
     zend_object std;
 };
 

@@ -137,11 +137,11 @@ std::vector<uint8_t> server_http_context::get_slot_state(int slot_id) {
 }
 
 // coro compatible
-size_t server_http_context::set_slot_state(int slot_id, const std::vector<uint8_t> & state_data) {
+size_t server_http_context::set_slot_state(int slot_id, const uint8_t * data, size_t len) {
     if (!ctx_server) {
         return 0;
     }
-    return ctx_server->set_slot_state(slot_id, state_data);
+    return ctx_server->set_slot_state(slot_id, data, len);
 }
 
 bool server_http_context::init(const common_params & params) {

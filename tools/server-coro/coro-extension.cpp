@@ -46,6 +46,46 @@ enum class ModelStatus {
     UNLOADING
 };
 
+// Session state blob stored in the session map
+// Uses zend_string* for zero-copy interop with PHP and direct buffer access for llama APIs
+struct SessionState {
+    zend_string *data = nullptr;
+    int64_t created_at = 0;
+    int64_t updated_at = 0;
+
+    SessionState() = default;
+
+    ~SessionState() {
+        if (data) {
+            zend_string_release(data);
+        }
+    }
+
+    // Move constructor
+    SessionState(SessionState &&other) noexcept
+        : data(other.data), created_at(other.created_at), updated_at(other.updated_at) {
+        other.data = nullptr;
+    }
+
+    // Move assignment
+    SessionState &operator=(SessionState &&other) noexcept {
+        if (this != &other) {
+            if (data) {
+                zend_string_release(data);
+            }
+            data = other.data;
+            created_at = other.created_at;
+            updated_at = other.updated_at;
+            other.data = nullptr;
+        }
+        return *this;
+    }
+
+    // Delete copy to prevent accidental 800MB copies
+    SessionState(const SessionState &) = delete;
+    SessionState &operator=(const SessionState &) = delete;
+};
+
 // Per-model instance
 struct ModelInstance {
     std::string name;
@@ -56,6 +96,10 @@ struct ModelInstance {
     std::atomic<ModelStatus> status{ModelStatus::LOADING};
     std::atomic<int64_t> last_used{0};
     std::string error_message;
+
+    // Session map: session_id -> KV cache state blob
+    std::map<int, SessionState> sessions;
+    std::mutex sessions_mutex;
     
     void update_last_used() {
         last_used.store(std::chrono::steady_clock::now().time_since_epoch().count());
@@ -146,6 +190,14 @@ static zend_object *llama_request_create_object(zend_class_entry *ce)
     intern->cancelled = std::make_shared<std::atomic<bool>>(false);
     intern->is_stream = false;
     intern->request_id = -1;  // Will be assigned in __construct
+
+    // Session fields
+    intern->session_model_inst = nullptr;
+    intern->session_id = -1;
+    intern->session_slot_id = -1;
+    intern->session_update = false;
+    intern->session_remove = false;
+    intern->session_saved = false;
 
     zend_object_std_init(&intern->std, ce);
     object_properties_init(&intern->std, ce);
@@ -522,6 +574,54 @@ static bool php_array_to_request(zval *z_request, server_http_req &req, std::sha
     return true;
 }
 
+// Helper: perform session save/remove after completion finishes
+static void session_post_completion(LlamaRequestObject *intern) {
+    if (!intern->session_model_inst || intern->session_saved) {
+        return;
+    }
+    intern->session_saved = true;
+
+    ModelInstance *inst = intern->session_model_inst;
+    int req_id = intern->request_id;
+
+    // Session remove
+    if (intern->session_remove && intern->session_id >= 0) {
+        PHP_DBG(req_id, "removing session %d", intern->session_id);
+        std::lock_guard<std::mutex> slock(inst->sessions_mutex);
+        inst->sessions.erase(intern->session_id);
+    }
+
+    // Session save: capture KV cache state from slot after completion
+    if (intern->session_update && intern->session_id >= 0 && intern->session_slot_id >= 0) {
+        PHP_DBG(req_id, "saving session %d from slot %d", intern->session_id, intern->session_slot_id);
+        std::vector<uint8_t> state_data = inst->ctx_server->get_slot_state(intern->session_slot_id);
+        if (state_data.empty()) {
+            PHP_DBG(req_id, "WARNING: session save failed for session %d from slot %d",
+                    intern->session_id, intern->session_slot_id);
+        } else {
+            PHP_DBG(req_id, "session save OK: %zu bytes from slot %d", state_data.size(), intern->session_slot_id);
+            // Wrap vector into non-persistent zend_string for zero-copy storage
+            zend_string *zstr = zend_string_init(reinterpret_cast<const char *>(state_data.data()), state_data.size(), 0);
+            int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+            std::lock_guard<std::mutex> slock(inst->sessions_mutex);
+            auto sit = inst->sessions.find(intern->session_id);
+            if (sit != inst->sessions.end()) {
+                if (sit->second.data) {
+                    zend_string_release(sit->second.data);
+                }
+                sit->second.data = zstr;
+                sit->second.updated_at = now;
+            } else {
+                SessionState state;
+                state.data = zstr;
+                state.created_at = now;
+                state.updated_at = now;
+                inst->sessions.emplace(intern->session_id, std::move(state));
+            }
+        }
+    }
+}
+
 // Llama\Request::__construct(array $params)
 static PHP_METHOD(LlamaRequest, __construct)
 {
@@ -595,6 +695,53 @@ static PHP_METHOD(LlamaRequest, __construct)
         return;
     }
 
+    // Parse session fields from request body
+    {
+        try {
+            json body = json::parse(intern->request.body);
+            if (body.contains("session_id") && body["session_id"].is_number_integer()) {
+                intern->session_id = body["session_id"].get<int>();
+                intern->session_model_inst = inst;
+                intern->session_slot_id = json_value(body, "id_slot", -1);
+                intern->session_update = json_value(body, "session_update", false);
+                intern->session_remove = json_value(body, "session_remove", false);
+                PHP_DBG(req_id, "session: id=%d slot=%d update=%d remove=%d",
+                        intern->session_id, intern->session_slot_id,
+                        intern->session_update, intern->session_remove);
+            }
+        } catch (...) {
+            // body parse error is handled later by the handler
+        }
+    }
+
+    // Session restore: if session_id and id_slot are both set, restore KV cache before processing
+    if (intern->session_model_inst && intern->session_id >= 0 && intern->session_slot_id >= 0) {
+        const uint8_t *restore_ptr = nullptr;
+        size_t restore_len = 0;
+        {
+            std::lock_guard<std::mutex> slock(inst->sessions_mutex);
+            auto sit = inst->sessions.find(intern->session_id);
+            if (sit != inst->sessions.end() && sit->second.data) {
+                restore_ptr = reinterpret_cast<const uint8_t *>(ZSTR_VAL(sit->second.data));
+                restore_len = ZSTR_LEN(sit->second.data);
+            }
+        }
+        if (restore_ptr && restore_len > 0) {
+            PHP_DBG(req_id, "restoring session %d (%zu bytes) to slot %d",
+                    intern->session_id, restore_len, intern->session_slot_id);
+            size_t n_read = inst->ctx_server->set_slot_state(intern->session_slot_id, restore_ptr, restore_len);
+            if (n_read == 0) {
+                PHP_DBG(req_id, "WARNING: session restore failed for session %d to slot %d",
+                        intern->session_id, intern->session_slot_id);
+            } else {
+                PHP_DBG(req_id, "session restore OK: %zu bytes read", n_read);
+            }
+        } else {
+            PHP_DBG(req_id, "no session data found for session %d, proceeding without restore",
+                    intern->session_id);
+        }
+    }
+
     // Find handler using path matching
     std::map<std::string, std::string> path_params;
     PHP_DBG(req_id, "finding handler...");
@@ -651,6 +798,12 @@ static PHP_METHOD(LlamaRequest, __construct)
 
     intern->is_stream = intern->response->is_stream();
     PHP_DBG(req_id, "EXIT: is_stream=%d response_data_len=%zu", intern->is_stream, intern->response->data.size());
+
+    // For non-streaming: completion is already done at this point, perform session save/remove
+    if (!intern->is_stream && intern->session_model_inst) {
+        session_post_completion(intern);
+    }
+    // For streaming: session save/remove happens when stream ends (in next() returning null)
 }
 
 // Static helper: Convert nlohmann::json to PHP zval (recursive)
@@ -774,6 +927,10 @@ static PHP_METHOD(LlamaRequest, next)
 
         if (!has_more) {
             PHP_DBG(intern->request_id, "EXIT: has_more=false, stream ended");
+            // Stream ended: perform session save/remove
+            if (intern->session_model_inst) {
+                session_post_completion(intern);
+            }
             RETURN_NULL();
         }
 
@@ -846,6 +1003,38 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_unload_model, 0, 0, 1)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_list_models, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_session_get, 0, 0, 2)
+    ZEND_ARG_TYPE_INFO(0, model_name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, session_id, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_session_set, 0, 0, 3)
+    ZEND_ARG_TYPE_INFO(0, model_name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, session_id, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO(0, data, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_session_remove, 0, 0, 2)
+    ZEND_ARG_TYPE_INFO(0, model_name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, session_id, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_session_list, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, model_name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_session_save, 0, 0, 3)
+    ZEND_ARG_TYPE_INFO(0, model_name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, session_id, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO(0, slot_id, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_session_restore, 0, 0, 3)
+    ZEND_ARG_TYPE_INFO(0, model_name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, session_id, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO(0, slot_id, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 // swoole_llama_load_model(array $argv): bool
@@ -1030,6 +1219,293 @@ PHP_FUNCTION(swoole_llama_list_models)
     }
 }
 
+// swoole_llama_session_get(string $model_name, int $session_id): ?string
+// Returns the raw binary blob for the given session, or null if not found
+PHP_FUNCTION(swoole_llama_session_get)
+{
+    zend_string *z_model;
+    zend_long session_id;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STR(z_model)
+        Z_PARAM_LONG(session_id)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string model_name(ZSTR_VAL(z_model), ZSTR_LEN(z_model));
+
+    // Look up model under global lock, release before heavy copy
+    ModelInstance *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        auto it = g_models.find(model_name);
+        if (it == g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' not found", model_name.c_str());
+            RETURN_NULL();
+        }
+        inst = it->second.get();
+    }
+
+    std::lock_guard<std::mutex> slock(inst->sessions_mutex);
+    auto sit = inst->sessions.find(static_cast<int>(session_id));
+    if (sit == inst->sessions.end() || !sit->second.data) {
+        RETURN_NULL();
+    }
+
+    // Zero-copy: bump refcount and return the same zend_string
+    RETURN_STR(zend_string_copy(sit->second.data));
+}
+
+// swoole_llama_session_set(string $model_name, int $session_id, string $data): bool
+// Sets the raw binary blob for the given session (import from external storage)
+PHP_FUNCTION(swoole_llama_session_set)
+{
+    zend_string *z_model;
+    zend_long session_id;
+    zend_string *z_data;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_STR(z_model)
+        Z_PARAM_LONG(session_id)
+        Z_PARAM_STR(z_data)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string model_name(ZSTR_VAL(z_model), ZSTR_LEN(z_model));
+
+    // Look up model under global lock, release before heavy copy
+    ModelInstance *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        auto it = g_models.find(model_name);
+        if (it == g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' not found", model_name.c_str());
+            RETURN_FALSE;
+        }
+        inst = it->second.get();
+    }
+
+    // Zero-copy: bump refcount on the PHP string — no 800MB memcpy
+    zend_string *stored = zend_string_copy(z_data);
+    int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+
+    {
+        std::lock_guard<std::mutex> slock(inst->sessions_mutex);
+        auto sit = inst->sessions.find(static_cast<int>(session_id));
+        if (sit != inst->sessions.end()) {
+            if (sit->second.data) {
+                zend_string_release(sit->second.data);
+            }
+            sit->second.data = stored;
+            sit->second.updated_at = now;
+        } else {
+            SessionState state;
+            state.data = stored;
+            state.created_at = now;
+            state.updated_at = now;
+            inst->sessions.emplace(static_cast<int>(session_id), std::move(state));
+        }
+    }
+
+    RETURN_TRUE;
+}
+
+// swoole_llama_session_remove(string $model_name, int $session_id): bool
+PHP_FUNCTION(swoole_llama_session_remove)
+{
+    zend_string *z_model;
+    zend_long session_id;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STR(z_model)
+        Z_PARAM_LONG(session_id)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string model_name(ZSTR_VAL(z_model), ZSTR_LEN(z_model));
+
+    ModelInstance *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        auto it = g_models.find(model_name);
+        if (it == g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' not found", model_name.c_str());
+            RETURN_FALSE;
+        }
+        inst = it->second.get();
+    }
+
+    // Erase under session lock; move blob out so destructor runs outside the lock
+    SessionState removed_state;
+    bool erased = false;
+    {
+        std::lock_guard<std::mutex> slock(inst->sessions_mutex);
+        auto sit = inst->sessions.find(static_cast<int>(session_id));
+        if (sit != inst->sessions.end()) {
+            removed_state = std::move(sit->second);
+            inst->sessions.erase(sit);
+            erased = true;
+        }
+    }
+    // removed_state destructor (potentially large free) runs here, outside all locks
+
+    RETURN_BOOL(erased);
+}
+
+// swoole_llama_session_list(string $model_name): array
+// Returns array of session info: [['id' => int, 'size' => int, 'created_at' => int, 'updated_at' => int], ...]
+PHP_FUNCTION(swoole_llama_session_list)
+{
+    zend_string *z_model;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(z_model)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string model_name(ZSTR_VAL(z_model), ZSTR_LEN(z_model));
+
+    ModelInstance *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        auto it = g_models.find(model_name);
+        if (it == g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' not found", model_name.c_str());
+            array_init(return_value);
+            return;
+        }
+        inst = it->second.get();
+    }
+
+    std::lock_guard<std::mutex> slock(inst->sessions_mutex);
+
+    array_init(return_value);
+    for (const auto &[sid, state] : inst->sessions) {
+        zval entry;
+        array_init(&entry);
+        add_assoc_long(&entry, "id", sid);
+        add_assoc_long(&entry, "size", static_cast<zend_long>(state.data ? ZSTR_LEN(state.data) : 0));
+        add_assoc_long(&entry, "created_at", state.created_at);
+        add_assoc_long(&entry, "updated_at", state.updated_at);
+        add_next_index_zval(return_value, &entry);
+    }
+}
+
+// swoole_llama_session_save(string $model_name, int $session_id, int $slot_id): bool
+// Captures the current KV cache state of the given slot and stores it in the session map
+PHP_FUNCTION(swoole_llama_session_save)
+{
+    zend_string *z_model;
+    zend_long session_id;
+    zend_long slot_id;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_STR(z_model)
+        Z_PARAM_LONG(session_id)
+        Z_PARAM_LONG(slot_id)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string model_name(ZSTR_VAL(z_model), ZSTR_LEN(z_model));
+
+    ModelInstance *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        auto it = g_models.find(model_name);
+        if (it == g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' not found", model_name.c_str());
+            RETURN_FALSE;
+        }
+        inst = it->second.get();
+    }
+
+    if (inst->status.load() != ModelStatus::LOADED) {
+        php_error_docref(nullptr, E_WARNING, "Model '%s' is not ready", model_name.c_str());
+        RETURN_FALSE;
+    }
+
+    // Use existing thread-safe get_slot_state which posts SEQ_STATE_GET to inference thread
+    std::vector<uint8_t> state_data = inst->ctx_server->get_slot_state(static_cast<int>(slot_id));
+    if (state_data.empty()) {
+        php_error_docref(nullptr, E_WARNING, "Failed to get slot state for slot %d", static_cast<int>(slot_id));
+        RETURN_FALSE;
+    }
+
+    // Wrap vector into non-persistent zend_string for zero-copy storage
+    zend_string *zstr = zend_string_init(reinterpret_cast<const char *>(state_data.data()), state_data.size(), 0);
+    int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+    {
+        std::lock_guard<std::mutex> slock(inst->sessions_mutex);
+        auto sit = inst->sessions.find(static_cast<int>(session_id));
+        if (sit != inst->sessions.end()) {
+            if (sit->second.data) {
+                zend_string_release(sit->second.data);
+            }
+            sit->second.data = zstr;
+            sit->second.updated_at = now;
+        } else {
+            SessionState state;
+            state.data = zstr;
+            state.created_at = now;
+            state.updated_at = now;
+            inst->sessions.emplace(static_cast<int>(session_id), std::move(state));
+        }
+    }
+
+    RETURN_TRUE;
+}
+
+// swoole_llama_session_restore(string $model_name, int $session_id, int $slot_id): bool
+// Restores the KV cache state from the session map into the given slot
+PHP_FUNCTION(swoole_llama_session_restore)
+{
+    zend_string *z_model;
+    zend_long session_id;
+    zend_long slot_id;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_STR(z_model)
+        Z_PARAM_LONG(session_id)
+        Z_PARAM_LONG(slot_id)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string model_name(ZSTR_VAL(z_model), ZSTR_LEN(z_model));
+
+    ModelInstance *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        auto it = g_models.find(model_name);
+        if (it == g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' not found", model_name.c_str());
+            RETURN_FALSE;
+        }
+        inst = it->second.get();
+    }
+
+    if (inst->status.load() != ModelStatus::LOADED) {
+        php_error_docref(nullptr, E_WARNING, "Model '%s' is not ready", model_name.c_str());
+        RETURN_FALSE;
+    }
+
+    // Get session state pointer — safe to read directly since coroutine blocks until set_slot_state returns
+    const uint8_t *restore_ptr = nullptr;
+    size_t restore_len = 0;
+    {
+        std::lock_guard<std::mutex> slock(inst->sessions_mutex);
+        auto sit = inst->sessions.find(static_cast<int>(session_id));
+        if (sit == inst->sessions.end() || !sit->second.data) {
+            php_error_docref(nullptr, E_WARNING, "Session %d not found for model '%s'", static_cast<int>(session_id), model_name.c_str());
+            RETURN_FALSE;
+        }
+        restore_ptr = reinterpret_cast<const uint8_t *>(ZSTR_VAL(sit->second.data));
+        restore_len = ZSTR_LEN(sit->second.data);
+    }
+
+    // Use existing thread-safe set_slot_state which posts SEQ_STATE_SET to inference thread
+    size_t n_read = inst->ctx_server->set_slot_state(static_cast<int>(slot_id), restore_ptr, restore_len);
+    if (n_read == 0) {
+        php_error_docref(nullptr, E_WARNING, "Failed to restore session %d to slot %d", static_cast<int>(session_id), static_cast<int>(slot_id));
+        RETURN_FALSE;
+    }
+
+    RETURN_TRUE;
+}
+
 // Function entries
 static const zend_function_entry swoole_llama_functions[] = {
     PHP_FE(swoole_llama_init, arginfo_swoole_llama_init)
@@ -1039,6 +1515,12 @@ static const zend_function_entry swoole_llama_functions[] = {
     PHP_FE(swoole_llama_model_ready, arginfo_swoole_llama_model_ready)
     PHP_FE(swoole_llama_unload_model, arginfo_swoole_llama_unload_model)
     PHP_FE(swoole_llama_list_models, arginfo_swoole_llama_list_models)
+    PHP_FE(swoole_llama_session_get, arginfo_swoole_llama_session_get)
+    PHP_FE(swoole_llama_session_set, arginfo_swoole_llama_session_set)
+    PHP_FE(swoole_llama_session_remove, arginfo_swoole_llama_session_remove)
+    PHP_FE(swoole_llama_session_list, arginfo_swoole_llama_session_list)
+    PHP_FE(swoole_llama_session_save, arginfo_swoole_llama_session_save)
+    PHP_FE(swoole_llama_session_restore, arginfo_swoole_llama_session_restore)
     PHP_FE_END
 };
 

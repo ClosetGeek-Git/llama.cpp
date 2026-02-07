@@ -2059,6 +2059,9 @@ private:
                     res->state_data.resize(n_written); // trim to actual written size
                     res->n_bytes = n_written;
 
+                    // Also save the slot's prompt tokens so they can be restored alongside KV cache
+                    res->prompt_tokens = slot->prompt.tokens.get_text_tokens();
+
                     const int64_t t_end = ggml_time_us();
                     res->t_ms = (t_end - t_start) / 1000.0;
 
@@ -2080,11 +2083,23 @@ private:
 
                     const int64_t t_start = ggml_time_us();
 
-                    const std::vector<uint8_t> & state_data = task.seq_state_action.state_data;
-
-                    // Restore the sequence state from the buffer
-                    const size_t n_read = llama_state_seq_set_data(ctx, state_data.data(), state_data.size(), slot->id);
+                    // Restore the sequence state from the raw buffer pointer
+                    const size_t n_read = llama_state_seq_set_data(ctx, task.seq_state_action.state_ptr, task.seq_state_action.state_len, slot->id);
                     const bool success = (n_read > 0);
+
+                    // Sync slot prompt tracking with restored KV cache state
+                    if (success) {
+                        slot->prompt.tokens.clear();
+                        if (task.seq_state_action.prompt_tokens_ptr && task.seq_state_action.prompt_tokens_count > 0) {
+                            llama_tokens tokens(
+                                task.seq_state_action.prompt_tokens_ptr,
+                                task.seq_state_action.prompt_tokens_ptr + task.seq_state_action.prompt_tokens_count);
+                            slot->prompt.tokens.insert(tokens);
+                            SRV_INF("slot %d: restored prompt tracking with %zu tokens\n", id_slot, task.seq_state_action.prompt_tokens_count);
+                        } else {
+                            SRV_WRN("slot %d: no prompt tokens provided with state restore - prompt cache will be empty\n", id_slot);
+                        }
+                    }
 
                     const int64_t t_end = ggml_time_us();
 
@@ -3293,16 +3308,58 @@ std::vector<uint8_t> server_context::get_slot_state(int slot_id) {
         return {};
     }
 
-    return std::move(res->state_data);
+    // Encode prompt tokens + KV data into a single blob:
+    // [magic:4 "SES1"][n_tokens:4][tokens:n*sizeof(llama_token)][kv_data:rest]
+    const auto & kv_data = res->state_data;
+    const auto & prompt_tokens = res->prompt_tokens;
+    const uint32_t n_tokens = (uint32_t) prompt_tokens.size();
+
+    const size_t header_size = 4 + sizeof(uint32_t) + n_tokens * sizeof(llama_token);
+    const size_t total_size = header_size + kv_data.size();
+    std::vector<uint8_t> blob(total_size);
+    uint8_t * ptr = blob.data();
+
+    memcpy(ptr, "SES1", 4); ptr += 4;
+    memcpy(ptr, &n_tokens, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+    if (n_tokens > 0) {
+        memcpy(ptr, prompt_tokens.data(), n_tokens * sizeof(llama_token));
+        ptr += n_tokens * sizeof(llama_token);
+    }
+    memcpy(ptr, kv_data.data(), kv_data.size());
+
+    return blob;
 }
 
-size_t server_context::set_slot_state(int slot_id, const std::vector<uint8_t> & state_data) {
+size_t server_context::set_slot_state(int slot_id, const uint8_t * data, size_t len) {
+    // Decode blob: check for SES1 magic header to extract prompt tokens
+    const llama_token * prompt_tokens_ptr = nullptr;
+    size_t prompt_tokens_count = 0;
+    const uint8_t * kv_data = data;
+    size_t kv_len = len;
+
+    if (len >= 8 && memcmp(data, "SES1", 4) == 0) {
+        uint32_t n_tokens;
+        memcpy(&n_tokens, data + 4, sizeof(uint32_t));
+        const size_t header_size = 4 + sizeof(uint32_t) + n_tokens * sizeof(llama_token);
+        if (header_size <= len) {
+            if (n_tokens > 0) {
+                prompt_tokens_ptr = reinterpret_cast<const llama_token *>(data + 8);
+                prompt_tokens_count = n_tokens;
+            }
+            kv_data = data + header_size;
+            kv_len = len - header_size;
+        }
+    }
+
     auto reader = impl->get_response_reader();
 
     server_task task(SERVER_TASK_TYPE_SEQ_STATE_SET);
     task.id = reader.get_new_id();
     task.seq_state_action.slot_id = slot_id;
-    task.seq_state_action.state_data = state_data;
+    task.seq_state_action.state_ptr = kv_data;
+    task.seq_state_action.state_len = kv_len;
+    task.seq_state_action.prompt_tokens_ptr = prompt_tokens_ptr;
+    task.seq_state_action.prompt_tokens_count = prompt_tokens_count;
 
     reader.post_task(std::move(task));
 

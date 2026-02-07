@@ -152,7 +152,10 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SEQ_STATE_GET, SERVER_TASK_TYPE_SEQ_STATE_SET
     struct seq_state_action {
         int slot_id;
-        std::vector<uint8_t> state_data; // for SET: input data; for GET: unused
+        const uint8_t * state_ptr = nullptr;        // for SET: pointer to KV state data (caller owns lifetime)
+        size_t state_len = 0;                        // for SET: length of KV state data
+        const llama_token * prompt_tokens_ptr = nullptr; // for SET: prompt tokens to restore (caller owns lifetime)
+        size_t prompt_tokens_count = 0;                  // for SET: number of prompt tokens
     };
     seq_state_action seq_state_action;
 
@@ -558,6 +561,7 @@ struct server_task_result_apply_lora : server_task_result {
 
 struct server_task_result_seq_state_get : server_task_result {
     std::vector<uint8_t> state_data;
+    llama_tokens prompt_tokens; // the slot's prompt tokens at time of save
     size_t n_bytes;
     double t_ms;
 

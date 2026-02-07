@@ -174,7 +174,7 @@ struct server_http_context {
 
     // Slot state operations (delegate to ctx_server)
     std::vector<uint8_t> get_slot_state(int slot_id);
-    size_t set_slot_state(int slot_id, const std::vector<uint8_t> & state_data);
+    size_t set_slot_state(int slot_id, const uint8_t * data, size_t len);
 
     server_http_context();
     ~server_http_context();

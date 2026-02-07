@@ -81,9 +81,10 @@ struct server_context {
     // Returns the serialized state data, or empty vector on error
     std::vector<uint8_t> get_slot_state(int slot_id);
 
-    // Set the KV cache state for a specific slot
-    // Returns the number of bytes read from state_data, or 0 on error
-    size_t set_slot_state(int slot_id, const std::vector<uint8_t> & state_data);
+    // Set the KV cache state for a specific slot from a raw buffer
+    // The caller must keep the buffer alive until this call returns (synchronous)
+    // Returns the number of bytes read, or 0 on error
+    size_t set_slot_state(int slot_id, const uint8_t * data, size_t len);
 };
 
 
