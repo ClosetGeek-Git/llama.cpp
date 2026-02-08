@@ -85,6 +85,16 @@ struct server_context {
     // The caller must keep the buffer alive until this call returns (synchronous)
     // Returns the number of bytes read, or 0 on error
     size_t set_slot_state(int slot_id, const uint8_t * data, size_t len);
+
+    // Get the slot's current prompt tokens (lightweight, no KV serialization)
+    // Returns the token vector, or empty vector on error
+    llama_tokens get_slot_tokens(int slot_id);
+
+    // Perform a manual context shift on a slot
+    // n_keep: number of tokens to keep from the beginning
+    // n_discard: number of tokens to discard after n_keep
+    // Returns the new token count after shift, or -1 on error
+    int context_shift(int slot_id, int n_keep, int n_discard);
 };
 
 

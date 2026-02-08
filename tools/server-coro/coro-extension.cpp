@@ -47,9 +47,11 @@ enum class ModelStatus {
 };
 
 // Session state blob stored in the session map
-// Uses zend_string* for zero-copy interop with PHP and direct buffer access for llama APIs
+// Uses persistent zend_string* (pemalloc) so blobs survive across Swoole's coroutine/request
+// boundaries. PHP userspace receives non-persistent copies via session_get; the session map
+// always owns persistent copies that are freed with zend_string_release (which calls pefree).
 struct SessionState {
-    zend_string *data = nullptr;
+    zend_string *data = nullptr;  // ALWAYS persistent (allocated with persistent=1)
     int64_t created_at = 0;
     int64_t updated_at = 0;
 
@@ -96,6 +98,9 @@ struct ModelInstance {
     std::atomic<ModelStatus> status{ModelStatus::LOADING};
     std::atomic<int64_t> last_used{0};
     std::string error_message;
+
+    // Boundary token for message delimiter scanning (set once at model load, read-only after)
+    llama_token boundary_eot = LLAMA_TOKEN_NULL;
 
     // Session map: session_id -> KV cache state blob
     std::map<int, SessionState> sessions;
@@ -397,6 +402,14 @@ PHP_FUNCTION(swoole_llama_init)
                 return;
             }
             inst_ptr->routes->update_meta(*inst_ptr->ctx_server);
+            // Resolve boundary EOT token for message boundary scanning
+            {
+                llama_context * lctx = inst_ptr->ctx_server->get_llama_context();
+                if (lctx) {
+                    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(lctx));
+                    inst_ptr->boundary_eot = llama_vocab_eot(vocab);
+                }
+            }
             inst_ptr->status.store(ModelStatus::LOADED);
             inst_ptr->ctx_server->start_loop();
         } catch (const std::exception &e) {
@@ -600,8 +613,8 @@ static void session_post_completion(LlamaRequestObject *intern) {
                     intern->session_id, intern->session_slot_id);
         } else {
             PHP_DBG(req_id, "session save OK: %zu bytes from slot %d", state_data.size(), intern->session_slot_id);
-            // Wrap vector into non-persistent zend_string for zero-copy storage
-            zend_string *zstr = zend_string_init(reinterpret_cast<const char *>(state_data.data()), state_data.size(), 0);
+            // Persistent zend_string — survives across Swoole coroutine/request boundaries
+            zend_string *zstr = zend_string_init(reinterpret_cast<const char *>(state_data.data()), state_data.size(), 1);
             int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
             std::lock_guard<std::mutex> slock(inst->sessions_mutex);
             auto sit = inst->sessions.find(intern->session_id);
@@ -1127,6 +1140,14 @@ PHP_FUNCTION(swoole_llama_load_model)
                 return;
             }
             inst_ptr->routes->update_meta(*inst_ptr->ctx_server);
+            // Resolve boundary EOT token for message boundary scanning
+            {
+                llama_context * lctx = inst_ptr->ctx_server->get_llama_context();
+                if (lctx) {
+                    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(lctx));
+                    inst_ptr->boundary_eot = llama_vocab_eot(vocab);
+                }
+            }
             inst_ptr->status.store(ModelStatus::LOADED);
             inst_ptr->ctx_server->start_loop();
         } catch (const std::exception &e) {
@@ -1251,8 +1272,8 @@ PHP_FUNCTION(swoole_llama_session_get)
         RETURN_NULL();
     }
 
-    // Zero-copy: bump refcount and return the same zend_string
-    RETURN_STR(zend_string_copy(sit->second.data));
+    // Return a non-persistent copy for PHP userspace (SessionState holds persistent original)
+    RETURN_STR(zend_string_init(ZSTR_VAL(sit->second.data), ZSTR_LEN(sit->second.data), 0));
 }
 
 // swoole_llama_session_set(string $model_name, int $session_id, string $data): bool
@@ -1283,8 +1304,8 @@ PHP_FUNCTION(swoole_llama_session_set)
         inst = it->second.get();
     }
 
-    // Zero-copy: bump refcount on the PHP string — no 800MB memcpy
-    zend_string *stored = zend_string_copy(z_data);
+    // Persistent copy — SessionState owns persistent strings, PHP owns non-persistent ones
+    zend_string *stored = zend_string_init(ZSTR_VAL(z_data), ZSTR_LEN(z_data), 1);
     int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
 
     {
@@ -1426,8 +1447,8 @@ PHP_FUNCTION(swoole_llama_session_save)
         RETURN_FALSE;
     }
 
-    // Wrap vector into non-persistent zend_string for zero-copy storage
-    zend_string *zstr = zend_string_init(reinterpret_cast<const char *>(state_data.data()), state_data.size(), 0);
+    // Persistent zend_string — survives across Swoole coroutine/request boundaries
+    zend_string *zstr = zend_string_init(reinterpret_cast<const char *>(state_data.data()), state_data.size(), 1);
     int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
     {
         std::lock_guard<std::mutex> slock(inst->sessions_mutex);
@@ -1506,6 +1527,207 @@ PHP_FUNCTION(swoole_llama_session_restore)
     RETURN_TRUE;
 }
 
+// ── Boundary scan helper ──
+// Scans a flat token array for EOT tokens to find message boundaries.
+// Returns a vector of {start_pos, end_pos} pairs (end_pos is inclusive of the EOT token).
+// The first message starts at position 0, subsequent messages start at previous end_pos + 1.
+struct MessageBoundary {
+    int start;
+    int end;  // inclusive of the boundary token
+};
+
+static std::vector<MessageBoundary> scan_message_boundaries(
+    const llama_token *tokens, int n_tokens, llama_token eot)
+{
+    std::vector<MessageBoundary> boundaries;
+    if (n_tokens <= 0 || eot == LLAMA_TOKEN_NULL) {
+        return boundaries;
+    }
+
+    int msg_start = 0;
+    for (int i = 0; i < n_tokens; i++) {
+        if (tokens[i] == eot) {
+            boundaries.push_back({msg_start, i});
+            msg_start = i + 1;
+        }
+    }
+    // If there are trailing tokens after the last EOT (e.g. generation tokens not yet terminated),
+    // include them as a partial message
+    if (msg_start < n_tokens) {
+        boundaries.push_back({msg_start, n_tokens - 1});
+    }
+
+    return boundaries;
+}
+
+// Arginfo for new functions
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_slot_info, 0, 0, 2)
+    ZEND_ARG_TYPE_INFO(0, model_name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, slot_id, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_context_shift, 0, 0, 3)
+    ZEND_ARG_TYPE_INFO(0, model_name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, slot_id, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO(0, from_msg, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO(0, preserve_system, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
+// swoole_llama_slot_info(string $model_name, int $slot_id): ?array
+// Returns slot info including message boundaries detected via EOT scanning.
+// ['n_tokens' => N, 'boundary_eot' => int, 'messages' => [['index' => 0, 'start' => 0, 'end' => 150], ...]]
+PHP_FUNCTION(swoole_llama_slot_info)
+{
+    zend_string *z_model;
+    zend_long slot_id;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STR(z_model)
+        Z_PARAM_LONG(slot_id)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string model_name(ZSTR_VAL(z_model), ZSTR_LEN(z_model));
+
+    ModelInstance *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        auto it = g_models.find(model_name);
+        if (it == g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' not found", model_name.c_str());
+            RETURN_NULL();
+        }
+        inst = it->second.get();
+    }
+
+    if (inst->status.load() != ModelStatus::LOADED) {
+        php_error_docref(nullptr, E_WARNING, "Model '%s' is not ready", model_name.c_str());
+        RETURN_NULL();
+    }
+
+    // Get slot tokens (lightweight — no KV serialization)
+    llama_tokens tokens = inst->ctx_server->get_slot_tokens(static_cast<int>(slot_id));
+    if (tokens.empty()) {
+        php_error_docref(nullptr, E_WARNING, "Failed to get tokens for slot %d", static_cast<int>(slot_id));
+        RETURN_NULL();
+    }
+
+    // Scan for message boundaries
+    auto boundaries = scan_message_boundaries(tokens.data(), static_cast<int>(tokens.size()), inst->boundary_eot);
+
+    // Build result array
+    array_init(return_value);
+    add_assoc_long(return_value, "n_tokens", static_cast<zend_long>(tokens.size()));
+    add_assoc_long(return_value, "boundary_eot", static_cast<zend_long>(inst->boundary_eot));
+    add_assoc_long(return_value, "n_messages", static_cast<zend_long>(boundaries.size()));
+
+    zval messages_arr;
+    array_init(&messages_arr);
+    for (size_t i = 0; i < boundaries.size(); i++) {
+        zval entry;
+        array_init(&entry);
+        add_assoc_long(&entry, "index", static_cast<zend_long>(i));
+        add_assoc_long(&entry, "start", static_cast<zend_long>(boundaries[i].start));
+        add_assoc_long(&entry, "end", static_cast<zend_long>(boundaries[i].end));
+        add_next_index_zval(&messages_arr, &entry);
+    }
+    add_assoc_zval(return_value, "messages", &messages_arr);
+}
+
+// swoole_llama_context_shift(string $model_name, int $slot_id, int $from_msg, bool $preserve_system = true): bool
+// Performs a manual context shift, removing messages from index $from_msg (inclusive) and older.
+// If $preserve_system is true, keeps the first message (system prompt) intact.
+PHP_FUNCTION(swoole_llama_context_shift)
+{
+    zend_string *z_model;
+    zend_long slot_id;
+    zend_long from_msg;
+    zend_bool preserve_system = 1;
+
+    ZEND_PARSE_PARAMETERS_START(3, 4)
+        Z_PARAM_STR(z_model)
+        Z_PARAM_LONG(slot_id)
+        Z_PARAM_LONG(from_msg)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL(preserve_system)
+    ZEND_PARSE_PARAMETERS_END();
+
+    std::string model_name(ZSTR_VAL(z_model), ZSTR_LEN(z_model));
+
+    ModelInstance *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_models_mutex);
+        auto it = g_models.find(model_name);
+        if (it == g_models.end()) {
+            php_error_docref(nullptr, E_WARNING, "Model '%s' not found", model_name.c_str());
+            RETURN_FALSE;
+        }
+        inst = it->second.get();
+    }
+
+    if (inst->status.load() != ModelStatus::LOADED) {
+        php_error_docref(nullptr, E_WARNING, "Model '%s' is not ready", model_name.c_str());
+        RETURN_FALSE;
+    }
+
+    // Get slot tokens (lightweight — no KV serialization)
+    llama_tokens tokens = inst->ctx_server->get_slot_tokens(static_cast<int>(slot_id));
+    if (tokens.empty()) {
+        php_error_docref(nullptr, E_WARNING, "Failed to get tokens for slot %d", static_cast<int>(slot_id));
+        RETURN_FALSE;
+    }
+
+    // Scan for message boundaries
+    auto boundaries = scan_message_boundaries(tokens.data(), static_cast<int>(tokens.size()), inst->boundary_eot);
+
+    if (boundaries.empty()) {
+        php_error_docref(nullptr, E_WARNING, "No message boundaries found in slot %d (EOT token = %d)",
+                         static_cast<int>(slot_id), inst->boundary_eot);
+        RETURN_FALSE;
+    }
+
+    // Validate from_msg index
+    if (from_msg < 0 || from_msg >= static_cast<zend_long>(boundaries.size())) {
+        php_error_docref(nullptr, E_WARNING, "from_msg %d out of range (0-%zu)",
+                         static_cast<int>(from_msg), boundaries.size() - 1);
+        RETURN_FALSE;
+    }
+
+    // Compute n_keep and n_discard
+    int n_keep;
+    int n_discard;
+
+    if (preserve_system) {
+        // Keep the first message (system prompt) — everything up to and including its EOT
+        if (from_msg == 0) {
+            php_error_docref(nullptr, E_WARNING, "Cannot shift system prompt (message 0) when preserve_system is true");
+            RETURN_FALSE;
+        }
+        // n_keep = tokens through end of message 0 (system prompt) + 1 (position after the EOT)
+        n_keep = boundaries[0].end + 1;
+        // Discard from message 1 through from_msg (inclusive)
+        n_discard = boundaries[from_msg].end + 1 - n_keep;
+    } else {
+        // Don't preserve anything before from_msg
+        n_keep = 0;
+        // Discard through end of from_msg
+        n_discard = boundaries[from_msg].end + 1;
+    }
+
+    if (n_discard <= 0) {
+        php_error_docref(nullptr, E_WARNING, "Nothing to discard (n_discard=%d)", n_discard);
+        RETURN_FALSE;
+    }
+
+    // Perform the context shift via the inference thread
+    int new_n_tokens = inst->ctx_server->context_shift(static_cast<int>(slot_id), n_keep, n_discard);
+    if (new_n_tokens < 0) {
+        php_error_docref(nullptr, E_WARNING, "Context shift failed for slot %d", static_cast<int>(slot_id));
+        RETURN_FALSE;
+    }
+
+    RETURN_TRUE;
+}
+
 // Function entries
 static const zend_function_entry swoole_llama_functions[] = {
     PHP_FE(swoole_llama_init, arginfo_swoole_llama_init)
@@ -1521,6 +1743,8 @@ static const zend_function_entry swoole_llama_functions[] = {
     PHP_FE(swoole_llama_session_list, arginfo_swoole_llama_session_list)
     PHP_FE(swoole_llama_session_save, arginfo_swoole_llama_session_save)
     PHP_FE(swoole_llama_session_restore, arginfo_swoole_llama_session_restore)
+    PHP_FE(swoole_llama_slot_info, arginfo_swoole_llama_slot_info)
+    PHP_FE(swoole_llama_context_shift, arginfo_swoole_llama_context_shift)
     PHP_FE_END
 };
 

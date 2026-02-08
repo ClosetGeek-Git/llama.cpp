@@ -2112,6 +2112,83 @@ private:
 
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_TOKENS:
+                {
+                    int id_slot = task.slot_tokens_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_tokens>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->prompt_tokens = slot->prompt.tokens.get_text_tokens();
+                    res->n_prompt_tokens_processed = slot->n_prompt_tokens_processed;
+
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CONTEXT_SHIFT:
+                {
+                    int id_slot = task.context_shift_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int n_keep    = task.context_shift_action.n_keep;
+                    const int n_discard = task.context_shift_action.n_discard;
+                    const int n_tokens  = slot->prompt.n_tokens();
+
+                    // Validate parameters
+                    if (n_keep < 0 || n_discard <= 0 || n_keep + n_discard > n_tokens) {
+                        send_error(task, "Invalid context shift parameters: n_keep=" + std::to_string(n_keep) +
+                                   " n_discard=" + std::to_string(n_discard) + " n_tokens=" + std::to_string(n_tokens),
+                                   ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    SRV_INF("slot %d: manual context shift, n_keep = %d, n_discard = %d, n_tokens = %d\n",
+                            id_slot, n_keep, n_discard, n_tokens);
+
+                    // Shift KV cache — same logic as auto context shift
+                    llama_memory_seq_rm (llama_get_memory(ctx), slot->id, n_keep,             n_keep + n_discard);
+                    llama_memory_seq_add(llama_get_memory(ctx), slot->id, n_keep + n_discard, n_tokens, -n_discard);
+
+                    // Update prompt tokens tracking to match shifted KV cache
+                    {
+                        GGML_ASSERT(!slot->prompt.tokens.has_mtmd);
+
+                        llama_tokens new_tokens = slot->prompt.tokens.get_text_tokens();
+                        for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
+                            new_tokens[i - n_discard] = new_tokens[i];
+                        }
+                        new_tokens.resize(n_tokens - n_discard);
+
+                        slot->prompt.tokens.clear();
+                        slot->prompt.tokens.insert(new_tokens);
+                    }
+
+                    auto res = std::make_unique<server_task_result_context_shift>();
+                    res->id           = task.id;
+                    res->id_slot      = id_slot;
+                    res->success      = true;
+                    res->new_n_tokens = slot->prompt.n_tokens();
+
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_TEST_STREAM:
                 {
                     // No-op streaming test - sends synthetic chunks without model inference
@@ -3374,6 +3451,52 @@ size_t server_context::set_slot_state(int slot_id, const uint8_t * data, size_t 
     }
 
     return res->n_bytes_read;
+}
+
+llama_tokens server_context::get_slot_tokens(int slot_id) {
+    auto reader = impl->get_response_reader();
+
+    server_task task(SERVER_TASK_TYPE_SLOT_TOKENS);
+    task.id = reader.get_new_id();
+    task.slot_tokens_action.slot_id = slot_id;
+
+    reader.post_task(std::move(task));
+
+    auto result = reader.next([]() { return false; });
+    if (!result || result->is_error()) {
+        return {};
+    }
+
+    auto * res = dynamic_cast<server_task_result_slot_tokens *>(result.get());
+    if (!res) {
+        return {};
+    }
+
+    return std::move(res->prompt_tokens);
+}
+
+int server_context::context_shift(int slot_id, int n_keep, int n_discard) {
+    auto reader = impl->get_response_reader();
+
+    server_task task(SERVER_TASK_TYPE_CONTEXT_SHIFT);
+    task.id = reader.get_new_id();
+    task.context_shift_action.slot_id   = slot_id;
+    task.context_shift_action.n_keep    = n_keep;
+    task.context_shift_action.n_discard = n_discard;
+
+    reader.post_task(std::move(task));
+
+    auto result = reader.next([]() { return false; });
+    if (!result || result->is_error()) {
+        return -1;
+    }
+
+    auto * res = dynamic_cast<server_task_result_context_shift *>(result.get());
+    if (!res || !res->success) {
+        return -1;
+    }
+
+    return res->new_n_tokens;
 }
 
 server_context_meta server_context::get_meta() const {

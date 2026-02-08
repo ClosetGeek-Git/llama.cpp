@@ -29,6 +29,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_SEQ_STATE_GET,
     SERVER_TASK_TYPE_SEQ_STATE_SET,
+    SERVER_TASK_TYPE_SLOT_TOKENS,     // get slot's current prompt tokens (lightweight, no KV serialize)
+    SERVER_TASK_TYPE_CONTEXT_SHIFT,   // manual context shift: remove tokens from KV cache
     SERVER_TASK_TYPE_TEST_STREAM,  // no-op streaming for testing PHP extension
 };
 
@@ -158,6 +160,20 @@ struct server_task {
         size_t prompt_tokens_count = 0;                  // for SET: number of prompt tokens
     };
     seq_state_action seq_state_action;
+
+    // used by SERVER_TASK_TYPE_SLOT_TOKENS
+    struct slot_tokens_action {
+        int slot_id;
+    };
+    slot_tokens_action slot_tokens_action;
+
+    // used by SERVER_TASK_TYPE_CONTEXT_SHIFT
+    struct context_shift_action {
+        int slot_id;
+        int n_keep;     // number of tokens to keep from the beginning
+        int n_discard;  // number of tokens to discard after n_keep
+    };
+    context_shift_action context_shift_action;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -574,6 +590,30 @@ struct server_task_result_seq_state_set : server_task_result {
     double t_ms;
 
     virtual json to_json() override;
+};
+
+struct server_task_result_slot_tokens : server_task_result {
+    llama_tokens prompt_tokens;
+    int n_prompt_tokens_processed;
+
+    virtual json to_json() override {
+        return json{
+            {"n_tokens", (int)prompt_tokens.size()},
+            {"n_prompt_tokens_processed", n_prompt_tokens_processed},
+        };
+    }
+};
+
+struct server_task_result_context_shift : server_task_result {
+    bool success;
+    int new_n_tokens;  // token count after shift
+
+    virtual json to_json() override {
+        return json{
+            {"success", success},
+            {"new_n_tokens", new_n_tokens},
+        };
+    }
 };
 
 // Test stream results - for testing PHP extension without model inference
