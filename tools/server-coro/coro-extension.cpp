@@ -10,6 +10,10 @@
 #include "server-common.h"
 #include "server-queue.h"
 
+// Swoole coroutine API for yielding
+#include "swoole_coroutine.h"
+#include "swoole_coroutine_api.h"
+
 #include <atomic>
 #include <memory>
 #include <thread>
@@ -150,6 +154,12 @@ static std::string extract_model_name(const std::string &body) {
 static void evict_lru_if_needed() {
     if (g_models_max == 0 || g_models.size() < g_models_max) return;
     
+    if (php_debug_enabled()) {
+        fprintf(stderr, "[PHP_DBG] evict_lru_if_needed: models=%zu max=%zu, searching for LRU...\n",
+                g_models.size(), g_models_max);
+        fflush(stderr);
+    }
+    
     std::string oldest_name;
     int64_t oldest_time = INT64_MAX;
     for (const auto &[name, inst] : g_models) {
@@ -159,6 +169,11 @@ static void evict_lru_if_needed() {
         }
     }
     if (!oldest_name.empty()) {
+        if (php_debug_enabled()) {
+            fprintf(stderr, "[PHP_DBG] evict_lru_if_needed: evicting model '%s' (last_used=%lld)\n",
+                    oldest_name.c_str(), (long long)oldest_time);
+            fflush(stderr);
+        }
         auto it = g_models.find(oldest_name);
         if (it != g_models.end()) {
             it->second->ctx_server->terminate();
@@ -166,6 +181,10 @@ static void evict_lru_if_needed() {
                 it->second->inference_thread.join();
             }
             g_models.erase(it);
+            if (php_debug_enabled()) {
+                fprintf(stderr, "[PHP_DBG] evict_lru_if_needed: eviction complete\n");
+                fflush(stderr);
+            }
         }
     }
 }
@@ -934,8 +953,21 @@ static PHP_METHOD(LlamaRequest, next)
     std::string chunk;
 
     // Loop until we get actual content or stream ends
+    // Safeguard: limit empty iterations to prevent busy-loop if something goes wrong
+    constexpr int MAX_EMPTY_ITERATIONS = 100;
+    int empty_iterations = 0;
+
     PHP_DBG(intern->request_id, "calling response->next()...");
     while (true) {
+        // Check cancellation before blocking call
+        if (intern->cancelled && intern->cancelled->load()) {
+            PHP_DBG(intern->request_id, "EXIT: cancelled flag set");
+            if (intern->session_model_inst) {
+                session_post_completion(intern);
+            }
+            RETURN_NULL();
+        }
+
         bool has_more = intern->response->next(chunk);
 
         if (!has_more) {
@@ -951,8 +983,23 @@ static PHP_METHOD(LlamaRequest, next)
             PHP_DBG(intern->request_id, "got chunk, len=%zu, first100=[%.*s]", chunk.size(), (int)std::min(chunk.size(), (size_t)100), chunk.c_str());
             break;
         }
-        // Empty chunk but has_more=true means flush/continue, keep looping
-        PHP_DBG(intern->request_id, "empty chunk, continuing loop...");
+
+        // Empty chunk but has_more=true means flush/continue
+        empty_iterations++;
+        PHP_DBG(intern->request_id, "empty chunk, iteration %d/%d", empty_iterations, MAX_EMPTY_ITERATIONS);
+
+        if (empty_iterations >= MAX_EMPTY_ITERATIONS) {
+            PHP_DBG(intern->request_id, "WARNING: exceeded max empty iterations (%d), breaking loop", MAX_EMPTY_ITERATIONS);
+            php_error_docref(nullptr, E_WARNING, "Streaming loop exceeded max empty iterations");
+            if (intern->session_model_inst) {
+                session_post_completion(intern);
+            }
+            RETURN_NULL();
+        }
+
+        // Yield coroutine briefly to prevent tight spinning on empty chunks
+        // This allows other coroutines to run and prevents CPU spin
+        swoole_coroutine_usleep(1);
     }
 
     // Parse JSON and return as array
