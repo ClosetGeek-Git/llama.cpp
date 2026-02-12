@@ -316,6 +316,12 @@ json format_response_rerank(
         std::vector<std::string> & texts,
         int top_n);
 
+// TODO: move it to server-task.cpp
+json format_response_classify(
+        const json & request,
+        const std::string & model_name,
+        const json & predictions);
+
 //
 // other utils
 //

@@ -26,6 +26,11 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_CLASSIFY,
+    SERVER_TASK_TYPE_SEQ_STATE_GET,
+    SERVER_TASK_TYPE_SEQ_STATE_SET,
+    SERVER_TASK_TYPE_SLOT_TOKENS,
+    SERVER_TASK_TYPE_CONTEXT_SHIFT,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -159,6 +164,30 @@ struct server_task {
     };
     slot_action slot_action;
 
+    // used by SERVER_TASK_TYPE_SEQ_STATE_GET, SERVER_TASK_TYPE_SEQ_STATE_SET
+    struct seq_state_action {
+        int slot_id;
+        const uint8_t * state_ptr = nullptr;
+        size_t state_len = 0;
+        const llama_token * prompt_tokens_ptr = nullptr;
+        size_t prompt_tokens_count = 0;
+    };
+    seq_state_action seq_state_action;
+
+    // used by SERVER_TASK_TYPE_SLOT_TOKENS
+    struct slot_tokens_action {
+        int slot_id;
+    };
+    slot_tokens_action slot_tokens_action;
+
+    // used by SERVER_TASK_TYPE_CONTEXT_SHIFT
+    struct context_shift_action {
+        int slot_id;
+        int n_keep;
+        int n_discard;
+    };
+    context_shift_action context_shift_action;
+
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
 
@@ -177,6 +206,7 @@ struct server_task {
         switch (type) {
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_CLASSIFY:
                 return true;
             default:
                 return false;
@@ -551,6 +581,55 @@ struct server_task_result_get_lora : server_task_result {
 
 struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
+};
+
+struct server_task_result_classify : server_task_result {
+    std::vector<std::pair<std::string, float>> predictions;
+
+    int32_t n_tokens;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_seq_state_get : server_task_result {
+    std::vector<uint8_t> state_data;
+    llama_tokens prompt_tokens;
+    size_t n_bytes;
+    double t_ms;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_seq_state_set : server_task_result {
+    size_t n_bytes_read;
+    bool success;
+    double t_ms;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_tokens : server_task_result {
+    llama_tokens prompt_tokens;
+    int n_prompt_tokens_processed;
+
+    virtual json to_json() override {
+        return json{
+            {"n_tokens", (int)prompt_tokens.size()},
+            {"n_prompt_tokens_processed", n_prompt_tokens_processed},
+        };
+    }
+};
+
+struct server_task_result_context_shift : server_task_result {
+    bool success;
+    int new_n_tokens;
+
+    virtual json to_json() override {
+        return json{
+            {"success", success},
+            {"new_n_tokens", new_n_tokens},
+        };
+    }
 };
 
 struct server_prompt_checkpoint {

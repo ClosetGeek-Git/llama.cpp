@@ -147,6 +147,7 @@ int main(int argc, char ** argv) {
         routes.post_embeddings             = models_routes->proxy_post;
         routes.post_embeddings_oai         = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
+        routes.post_classify               = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
@@ -187,8 +188,8 @@ int main(int argc, char ** argv) {
     ctx_http.post("/rerank",              ex_wrapper(routes.post_rerank));
     ctx_http.post("/reranking",           ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/rerank",           ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/reranking",        ex_wrapper(routes.post_rerank));
-    ctx_http.post("/tokenize",            ex_wrapper(routes.post_tokenize));
+    ctx_http.post("/v1/reranking",        ex_wrapper(routes.post_rerank));    ctx_http.post("/classify",             ex_wrapper(routes.post_classify));
+    ctx_http.post("/v1/classify",          ex_wrapper(routes.post_classify));    ctx_http.post("/tokenize",            ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",          ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",      ex_wrapper(routes.post_apply_template));
     // LoRA adapters hotswap
@@ -197,6 +198,7 @@ int main(int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",               ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",      ex_wrapper(routes.post_slots));
+    ctx_http.get ("/v1/slots/:id_slot/info", ex_wrapper(routes.get_slot_info));
 
     //
     // Start the server
