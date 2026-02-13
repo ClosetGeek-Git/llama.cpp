@@ -13,6 +13,11 @@ This document covers the additional API endpoints and slot management features a
   - [Get Tokens](#get-tokens)
   - [Context Shift](#context-shift)
 - [Slot Info](#slot-info)
+- [Server-Side Session Storage](#server-side-session-storage)
+  - [Save Session](#save-session)
+  - [Restore Session](#restore-session)
+  - [Remove Session](#remove-session)
+  - [List Sessions](#list-sessions)
 
 ---
 
@@ -350,6 +355,190 @@ curl -s http://localhost:8080/v1/slots/0/info | jq '{n_tokens, n_messages}'
 
 ---
 
+## Server-Side Session Storage
+
+Provides in-memory session storage on the server, eliminating the need to transfer large KV cache blobs (potentially 100MB-4GB) over HTTP for each save/restore operation. Sessions are stored by integer ID and persist until explicitly removed or the server restarts.
+
+This mirrors the session API in `server-coro` PHP extension (`swoole_llama_session_save`, `_restore`, `_remove`, `_list`).
+
+**Requires:** `--slots`
+
+### Save Session
+
+Saves a slot's KV cache state to server-side session storage.
+
+| Method | Path | Query |
+|--------|------|-------|
+| POST | `/sessions/:id_session` | `?action=save&slot=:id_slot` |
+
+#### Response
+
+```json
+{
+  "id_session": 42,
+  "id_slot": 0,
+  "n_tokens": 156,
+  "n_bytes": 4194560,
+  "t_ms": 12.5
+}
+```
+
+#### curl Example
+
+```bash
+# Save slot 0 to session 42
+curl -s -X POST "http://localhost:8080/sessions/42?action=save&slot=0" | jq .
+```
+
+---
+
+### Restore Session
+
+Restores a session from server-side storage to a slot. Optionally, can restore directly from a file if `--slot-save-path` is configured.
+
+| Method | Path | Query |
+|--------|------|-------|
+| POST | `/sessions/:id_session` | `?action=restore&slot=:id_slot` |
+
+#### Request Body (Optional JSON)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file` | string | Filename to restore from (requires `--slot-save-path`) |
+
+When `file` is provided, the session is restored from the specified file in the `--slot-save-path` directory instead of from server-side session storage. This allows for persistent file-based storage.
+
+#### Response
+
+```json
+{
+  "id_session": 42,
+  "id_slot": 0,
+  "n_bytes_read": 4194560,
+  "success": true,
+  "t_ms": 8.3
+}
+```
+
+#### curl Examples
+
+```bash
+# Restore session 42 from server-side storage to slot 1
+curl -s -X POST "http://localhost:8080/sessions/42?action=restore&slot=1" | jq .
+
+# Restore from file (requires --slot-save-path)
+curl -s -X POST "http://localhost:8080/sessions/42?action=restore&slot=1" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "session_42.bin"}' | jq .
+```
+
+---
+
+### Remove Session
+
+Removes a session from server-side storage. Optionally, saves the session to a file before removing if `--slot-save-path` is configured.
+
+| Method | Path | Query |
+|--------|------|-------|
+| POST | `/sessions/:id_session` | `?action=remove` |
+
+#### Request Body (Optional JSON)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file` | string | Filename to save session to before removing (requires `--slot-save-path`) |
+
+When `file` is provided, the session blob is saved to the specified file in the `--slot-save-path` directory before being removed from server-side storage. This enables archiving sessions to persistent storage.
+
+#### Response
+
+Without file:
+```json
+{
+  "id_session": 42,
+  "removed": true
+}
+```
+
+With file:
+```json
+{
+  "id_session": 42,
+  "removed": true,
+  "file": "session_42.bin",
+  "n_bytes": 4194560
+}
+```
+
+#### curl Examples
+
+```bash
+# Remove session 42 from memory
+curl -s -X POST "http://localhost:8080/sessions/42?action=remove" | jq .
+
+# Save to file before removing (requires --slot-save-path)
+curl -s -X POST "http://localhost:8080/sessions/42?action=remove" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "session_42.bin"}' | jq .
+```
+
+---
+
+### List Sessions
+
+Lists all sessions in server-side storage.
+
+| Method | Path |
+|--------|------|
+| GET | `/sessions` |
+
+#### Response
+
+```json
+[
+  {"id": 1, "size": 4194560, "created_at": 1739376000, "updated_at": 1739376120},
+  {"id": 42, "size": 8388608, "created_at": 1739375900, "updated_at": 1739376100}
+]
+```
+
+#### curl Example
+
+```bash
+curl -s http://localhost:8080/sessions | jq .
+```
+
+---
+
+### Multi-Turn Conversation Workflow
+
+```bash
+# Turn 1: Initial conversation
+curl -s -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "My name is Alice."}], "id_slot": 0}' | jq .
+
+# Save session
+curl -s -X POST "http://localhost:8080/sessions/1?action=save&slot=0" | jq .
+
+# Turn 2: Continue (restore first, then chat)
+curl -s -X POST "http://localhost:8080/sessions/1?action=restore&slot=0"
+curl -s -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [
+    {"role": "user", "content": "My name is Alice."},
+    {"role": "assistant", "content": "Hello Alice!"},
+    {"role": "user", "content": "What is my name?"}
+  ], "id_slot": 0}' | jq .
+
+# Update session with new state
+curl -s -X POST "http://localhost:8080/sessions/1?action=save&slot=0"
+
+# Cleanup when done
+curl -s -X POST "http://localhost:8080/sessions/1?action=remove"
+```
+
+---
+
 ## Summary of New Endpoints
 
 | Method | Path | Flag Required | Description |
@@ -360,5 +549,16 @@ curl -s http://localhost:8080/v1/slots/0/info | jq '{n_tokens, n_messages}'
 | POST | `/slots/:id?action=tokens` | `--slots` | Get slot's prompt token IDs |
 | POST | `/slots/:id?action=context-shift` | `--slots` | Manual KV cache context shift |
 | GET | `/v1/slots/:id/info` | `--slots` | Slot token state and message boundaries |
+| POST | `/sessions/:id?action=save&slot=N` | `--slots` | Save slot to server-side session storage |
+| POST | `/sessions/:id?action=restore&slot=N` | `--slots` | Restore session to slot (optional `{"file":"name"}` with `--slot-save-path`) |
+| POST | `/sessions/:id?action=remove` | `--slots` | Remove session (optional `{"file":"name"}` to save first with `--slot-save-path`) |
+| GET | `/sessions` | `--slots` | List all server-side sessions |
 
 The existing file-based slot actions (`save`, `restore`, `erase`) continue to require `--slot-save-path` and are unchanged.
+
+The `restore` and `remove` session actions support optional file-based storage when `--slot-save-path` is configured:
+
+- **Restore from file:** `POST /sessions/:id?action=restore&slot=N` with body `{"file": "session.bin"}` reads from file instead of session map
+- **Remove to file:** `POST /sessions/:id?action=remove` with body `{"file": "session.bin"}` saves to file before removing from map
+
+This enables a hybrid workflow: use fast server-side storage during active conversations, then archive/restore to files for persistence across server restarts.

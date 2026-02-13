@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <memory>
 #include <filesystem>
+#include <fstream>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -31,7 +32,7 @@ using json = nlohmann::ordered_json;
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 // SES1 binary format magic for slot state serialization
-static constexpr uint32_t SES1_MAGIC = 0x31534553; // "SES1" in little-endian
+static constexpr uint32_t SES1_MAGIC = 0x31534553; // \"SES1\" in little-endian
 
 // Message boundary detection for slot info endpoint
 struct message_boundary {
@@ -4285,6 +4286,38 @@ void server_routes::init_routes() {
         res->ok(result->to_json());
         return res;
     };
+
+    // Server-side session storage routes
+    this->post_sessions = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!params.endpoint_slots) {
+            res->error(format_error_response("This server does not support sessions. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        std::string id_session_str = req.get_param("id_session");
+        int id_session;
+        try {
+            id_session = std::stoi(id_session_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid session ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        return handle_sessions_action(req, id_session);
+    };
+
+    this->get_sessions = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!params.endpoint_slots) {
+            res->error(format_error_response("This server does not support sessions. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        return handle_sessions_list(req);
+    };
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
@@ -4741,5 +4774,310 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         ? format_embeddings_response_oaicompat(body, meta->model_name, responses, use_base64)
         : json(responses);
     res->ok(root);
+    return res;
+}
+
+// ================================================================================================
+// Server-side session storage handlers
+// ================================================================================================
+
+std::unique_ptr<server_res_generator> server_routes::handle_sessions_action(const server_http_req & req, int id_session) {
+    auto res = create_response();
+
+    std::string action = req.get_param("action");
+    std::string slot_str = req.get_param("slot");
+
+    if (action == "save") {
+        // Save slot state to session map
+        int id_slot;
+        try {
+            id_slot = std::stoi(slot_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Missing or invalid 'slot' parameter", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SEQ_STATE_GET);
+            task.id = rd.get_new_id();
+            task.seq_state_action.slot_id = id_slot;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * res_state = dynamic_cast<server_task_result_seq_state_get*>(result.get());
+        GGML_ASSERT(res_state != nullptr);
+
+        // Encode into SES1 binary format
+        const uint32_t n_tokens = (uint32_t)res_state->prompt_tokens.size();
+        const size_t header_size = sizeof(SES1_MAGIC) + sizeof(n_tokens) + n_tokens * sizeof(llama_token);
+        const size_t total_size = header_size + res_state->state_data.size();
+
+        std::vector<uint8_t> blob(total_size);
+        uint8_t * ptr = blob.data();
+        memcpy(ptr, &SES1_MAGIC, sizeof(SES1_MAGIC));
+        ptr += sizeof(SES1_MAGIC);
+        memcpy(ptr, &n_tokens, sizeof(n_tokens));
+        ptr += sizeof(n_tokens);
+        if (n_tokens > 0) {
+            memcpy(ptr, res_state->prompt_tokens.data(), n_tokens * sizeof(llama_token));
+            ptr += n_tokens * sizeof(llama_token);
+        }
+        memcpy(ptr, res_state->state_data.data(), res_state->state_data.size());
+
+        // Store in session map
+        int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            auto it = sessions.find(id_session);
+            if (it != sessions.end()) {
+                it->second.data = std::move(blob);
+                it->second.updated_at = now;
+            } else {
+                sessions.emplace(id_session, session_state(std::move(blob), now));
+            }
+        }
+
+        res->ok(json{
+            {"id_session", id_session},
+            {"id_slot",    id_slot},
+            {"n_tokens",   (int)n_tokens},
+            {"n_bytes",    (int)total_size},
+            {"t_ms",       res_state->t_ms},
+        });
+        return res;
+
+    } else if (action == "restore") {
+        // Restore session to slot from: 1) session map, or 2) file (if "file" param provided)
+        int id_slot;
+        try {
+            id_slot = std::stoi(slot_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Missing or invalid 'slot' parameter", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        std::vector<uint8_t> blob;
+
+        // Check for file parameter in JSON body
+        std::string filename;
+        if (!req.body.empty()) {
+            try {
+                json body_json = json::parse(req.body);
+                if (body_json.contains("file") && body_json["file"].is_string()) {
+                    filename = body_json["file"].get<std::string>();
+                }
+            } catch (const json::exception &) {
+                // No valid JSON body, continue without file
+            }
+        }
+
+        if (!filename.empty()) {
+            // File-based restore - validate and read file
+            if (params.slot_save_path.empty()) {
+                res->error(format_error_response("File-based restore requires --slot-save-path", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            if (!fs_validate_filename(filename)) {
+                res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            std::string filepath = params.slot_save_path + filename;
+
+            // Read file
+            std::ifstream ifs(filepath, std::ios::binary | std::ios::ate);
+            if (!ifs) {
+                res->error(format_error_response("File not found: " + filename, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            size_t file_size = ifs.tellg();
+            ifs.seekg(0, std::ios::beg);
+            blob.resize(file_size);
+            if (!ifs.read(reinterpret_cast<char*>(blob.data()), file_size)) {
+                res->error(format_error_response("Failed to read file: " + filename, ERROR_TYPE_SERVER));
+                return res;
+            }
+        } else {
+            // Map-based restore
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            auto it = sessions.find(id_session);
+            if (it == sessions.end()) {
+                res->error(format_error_response("Session not found", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            blob = it->second.data;  // copy - we can't hold lock during restore
+        }
+
+        // Parse SES1 format
+        const size_t min_header = sizeof(SES1_MAGIC) + sizeof(uint32_t);
+        if (blob.size() < min_header) {
+            res->error(format_error_response("Session data corrupted (too small)", ERROR_TYPE_SERVER));
+            return res;
+        }
+
+        const uint8_t * ptr = blob.data();
+        uint32_t magic;
+        memcpy(&magic, ptr, sizeof(magic));
+        ptr += sizeof(magic);
+        if (magic != SES1_MAGIC) {
+            res->error(format_error_response("Session data corrupted (invalid magic)", ERROR_TYPE_SERVER));
+            return res;
+        }
+
+        uint32_t n_tokens;
+        memcpy(&n_tokens, ptr, sizeof(n_tokens));
+        ptr += sizeof(n_tokens);
+
+        const size_t tokens_size = n_tokens * sizeof(llama_token);
+        if (blob.size() < min_header + tokens_size) {
+            res->error(format_error_response("Session data corrupted (truncated)", ERROR_TYPE_SERVER));
+            return res;
+        }
+
+        const llama_token * prompt_tokens_ptr = reinterpret_cast<const llama_token *>(ptr);
+        ptr += tokens_size;
+
+        const uint8_t * kv_data = ptr;
+        const size_t kv_len = blob.size() - (ptr - blob.data());
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SEQ_STATE_SET);
+            task.id = rd.get_new_id();
+            task.seq_state_action.slot_id = id_slot;
+            task.seq_state_action.state_ptr = kv_data;
+            task.seq_state_action.state_len = kv_len;
+            task.seq_state_action.prompt_tokens_ptr = prompt_tokens_ptr;
+            task.seq_state_action.prompt_tokens_count = n_tokens;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * res_set = dynamic_cast<server_task_result_seq_state_set*>(result.get());
+        GGML_ASSERT(res_set != nullptr);
+
+        res->ok(json{
+            {"id_session",   id_session},
+            {"id_slot",      id_slot},
+            {"n_bytes_read", (int)blob.size()},
+            {"success",      true},
+            {"t_ms",         res_set->t_ms},
+        });
+        return res;
+
+    } else if (action == "remove") {
+        // Remove session from map, optionally saving to file first
+        session_state removed;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            auto it = sessions.find(id_session);
+            if (it != sessions.end()) {
+                removed = std::move(it->second);
+                sessions.erase(it);
+                found = true;
+            }
+        }
+        // Destructor runs here, outside lock
+
+        if (!found) {
+            res->error(format_error_response("Session not found", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // Check for file parameter in JSON body - save to file before discarding
+        std::string filename;
+        if (!req.body.empty()) {
+            try {
+                json body_json = json::parse(req.body);
+                if (body_json.contains("file") && body_json["file"].is_string()) {
+                    filename = body_json["file"].get<std::string>();
+                }
+            } catch (const json::exception &) {
+                // No valid JSON body, continue without file
+            }
+        }
+
+        if (!filename.empty()) {
+            if (params.slot_save_path.empty()) {
+                res->error(format_error_response("File-based save requires --slot-save-path", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            if (!fs_validate_filename(filename)) {
+                res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            std::string filepath = params.slot_save_path + filename;
+
+            // Write blob to file
+            std::ofstream ofs(filepath, std::ios::binary | std::ios::trunc);
+            if (!ofs) {
+                res->error(format_error_response("Failed to create file: " + filename, ERROR_TYPE_SERVER));
+                return res;
+            }
+            if (!ofs.write(reinterpret_cast<const char*>(removed.data.data()), removed.data.size())) {
+                res->error(format_error_response("Failed to write file: " + filename, ERROR_TYPE_SERVER));
+                return res;
+            }
+
+            res->ok(json{
+                {"id_session", id_session},
+                {"removed",    true},
+                {"file",       filename},
+                {"n_bytes",    (int64_t)removed.data.size()},
+            });
+        } else {
+            res->ok(json{
+                {"id_session", id_session},
+                {"removed",    true},
+            });
+        }
+        return res;
+
+    } else {
+        res->error(format_error_response("Invalid action. Supported: save, restore, remove", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_sessions_list(const server_http_req &) {
+    auto res = create_response();
+
+    json sessions_array = json::array();
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex);
+        for (const auto & [id, state] : sessions) {
+            sessions_array.push_back(json{
+                {"id",         id},
+                {"size",       (int64_t)state.size()},
+                {"created_at", state.created_at},
+                {"updated_at", state.updated_at},
+            });
+        }
+    }
+
+    res->ok(sessions_array);
     return res;
 }

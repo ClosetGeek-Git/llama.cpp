@@ -48,11 +48,8 @@ enum server_state {
 struct server_slot {
     int id;
 
-    llama_batch batch_spec = {};
-
     // TODO: change to unique_ptrs for consistency:
     llama_context * ctx = nullptr;
-    llama_context * ctx_dft = nullptr;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -259,7 +256,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return ctx_dft;
+        return spec;
     }
 
     void add_token(const completion_token_output & token) {
@@ -553,15 +550,10 @@ private:
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
-    common_init_result_ptr llama_init_dft;
 
     llama_context * ctx = nullptr;
 
-    bool vocab_dft_compatible = true;
-
-    llama_model * model_dft = nullptr;
-
-    llama_context_params cparams_dft;
+    llama_model_ptr model_dft;
 
     llama_batch batch {};
 
@@ -608,13 +600,8 @@ private:
 
         // Clear any sampling context
         for (server_slot & slot : slots) {
-            llama_free(slot.ctx_dft);
-            slot.ctx_dft = nullptr;
-
             common_speculative_free(slot.spec);
             slot.spec = nullptr;
-
-            llama_batch_free(slot.batch_spec);
         }
 
         llama_batch_free(batch);
@@ -659,44 +646,39 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (params_base.has_speculative()) {
-            SRV_INF("loading draft model '%s'\n", params_base.speculative.model.path.c_str());
+        if (params_base.speculative.has_dft()) {
+            SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
+
+            const auto & params_spec = params_base.speculative;
 
             auto params_dft = params_base;
 
-            params_dft.devices      = params_base.speculative.devices;
-            params_dft.model        = params_base.speculative.model;
-            params_dft.n_ctx        = params_base.speculative.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_base.speculative.n_ctx;
-            params_dft.n_gpu_layers = params_base.speculative.n_gpu_layers;
             params_dft.n_parallel   = 1;
-            params_dft.cache_type_k = params_base.speculative.cache_type_k;
-            params_dft.cache_type_v = params_base.speculative.cache_type_v;
+            params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
+            params_dft.n_batch      = llama_n_ctx_seq(ctx);
+            params_dft.devices      = params_spec.devices;
+            params_dft.model        = params_spec.mparams_dft;
+            params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+            params_dft.cache_type_k = params_spec.cache_type_k;
+            params_dft.cache_type_v = params_spec.cache_type_v;
 
-            params_dft.cpuparams.n_threads = params_base.speculative.cpuparams.n_threads;
-            params_dft.cpuparams_batch.n_threads = params_base.speculative.cpuparams_batch.n_threads;
-            params_dft.tensor_buft_overrides = params_base.speculative.tensor_buft_overrides;
+            if (params_spec.cpuparams.n_threads > 0) {
+                params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+            }
 
-            llama_init_dft = common_init_from_params(params_dft);
+            params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
-            model_dft = llama_init_dft->model();
+            auto mparams_dft = common_model_params_to_llama(params_dft);
 
+            model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
             if (model_dft == nullptr) {
-                SRV_ERR("failed to load draft model, '%s'\n", params_base.speculative.model.path.c_str());
+                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                 return false;
             }
 
-            vocab_dft_compatible = common_speculative_are_compatible(ctx, llama_init_dft->context());
-            if (!vocab_dft_compatible) {
-                SRV_INF("the draft model '%s' is not compatible with the target model '%s'. tokens will be translated between the draft and target models.\n", params_base.speculative.model.path.c_str(), params_base.model.path.c_str());
-            }
-
-            const int n_ctx_dft = llama_n_ctx(llama_init_dft->context());
-
-            cparams_dft = common_context_params_to_llama(params_dft);
-            cparams_dft.n_batch = n_ctx_dft;
-
-            // the context is not needed - we will create one for each slot
-            llama_init_dft->free_context();
+            params_base.speculative.model_dft = model_dft.get();
+            params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
         }
 
         chat_templates = common_chat_templates_init(model, params_base.chat_template);
@@ -739,9 +721,9 @@ private:
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.has_speculative()) {
-                SRV_ERR("%s\n", "err: speculative decode is not supported by multimodal");
-                return false;
+            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
+                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+                SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
             }
         }
 
@@ -773,33 +755,33 @@ private:
 
         slots.clear();
 
+        const bool can_spec = common_speculative_is_compat(ctx);
+        if (!can_spec) {
+            SRV_WRN("%s", "speculative decoding not supported by this context\n");
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot slot;
 
-            slot.id = i;
-            slot.ctx = ctx;
+            slot.id    = i;
+            slot.ctx   = ctx;
             slot.n_ctx = n_ctx_slot;
-            slot.mctx = mctx;
+
+            slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
-            if (model_dft) {
-                slot.batch_spec = llama_batch_init(params_base.speculative.n_max + 1, 0, 1);
-
-                // TODO: rework speculative decoding [TAG_SERVER_SPEC_REWORK]
-                slot.ctx_dft = llama_init_from_model(model_dft, cparams_dft);
-                if (slot.ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create draft context\n");
-                    return false;
-                }
-
-                slot.spec = common_speculative_init(slot.ctx, slot.ctx_dft);
-                if (slot.spec == nullptr) {
-                    SRV_ERR("%s", "failed to create speculator\n");
-                    return false;
-                }
-                for (auto & pair : params_base.speculative.replacements) {
-                    common_speculative_add_replacement_tgt_dft(slot.spec, pair.first.c_str(), pair.second.c_str());
+            // try speculative decoding
+            if (can_spec) {
+                slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
+                if (slot.spec) {
+                    if (mctx) {
+                        SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
+                        return false;
+                    }
+                    SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+                } else {
+                    SLT_INF(slot, "%s", "speculative decoding context not initialized\n");
                 }
             }
 
@@ -1179,7 +1161,7 @@ private:
             backend_sampling &= task.params.sampling.backend_sampling;
 
             // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.ctx_dft && task.params.speculative.n_max > 0);
+            backend_sampling &= !(slot.spec && task.params.speculative.n_max > 0);
 
             // TODO: getting post/pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_logits;
@@ -1194,14 +1176,6 @@ private:
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
         } else {
             slot.smpl.reset();
-        }
-
-        // initialize draft batch
-        // TODO: rework speculative decoding [TAG_SERVER_SPEC_REWORK]
-        if (slot.ctx_dft) {
-            llama_batch_free(slot.batch_spec);
-
-            slot.batch_spec = llama_batch_init(task.params.speculative.n_max + 1, 0, 1);
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
@@ -2394,12 +2368,16 @@ private:
                     GGML_ABORT("not supported by multimodal");
                 }
 
-                struct common_speculative_params params_spec;
-                params_spec.n_draft = n_draft_max;
-                params_spec.n_reuse = llama_n_ctx(slot.ctx_dft) - slot.task->params.speculative.n_max;
-                params_spec.p_min   = slot.task->params.speculative.p_min;
                 const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
-                llama_tokens draft = common_speculative_gen_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+
+                const auto & params_spec = slot.task->params.speculative;
+
+                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+
+                if (draft.size() > (size_t) n_draft_max) {
+                    SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
+                    draft.resize(n_draft_max);
+                }
 
                 // add the sampled token to the batch
                 slot.i_batch_dft.push_back(batch.n_tokens);
@@ -3519,7 +3497,7 @@ server_context_meta server_context::get_meta() const {
         /* pooling_type           */ llama_pooling_type(impl->ctx),
 
         /* chat_template          */ common_chat_templates_source(impl->chat_templates.get()),
-        /* chat_template_tool_use */ tool_use_src ? tool_use_src : "",
+        /* chat_template_tool_use */ tool_use_src.empty() ? "" : tool_use_src,
 
         /* bos_token_str          */ bos_token_str,
         /* eos_token_str          */ eos_token_str,

@@ -199,6 +199,9 @@ int main(int argc, char ** argv) {
     ctx_http.get ("/slots",               ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",      ex_wrapper(routes.post_slots));
     ctx_http.get ("/v1/slots/:id_slot/info", ex_wrapper(routes.get_slot_info));
+    // Server-side session storage
+    ctx_http.post("/sessions/:id_session", ex_wrapper(routes.post_sessions));
+    ctx_http.get ("/sessions",             ex_wrapper(routes.get_sessions));
 
     //
     // Start the server

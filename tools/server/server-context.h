@@ -5,7 +5,11 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 struct server_context_impl; // private implementation
 
@@ -72,6 +76,25 @@ struct server_context {
 // forward declarations
 struct server_res_generator;
 
+// Server-side session storage entry
+struct session_state {
+    std::vector<uint8_t> data;  // SES1-format blob
+    int64_t created_at = 0;
+    int64_t updated_at = 0;
+
+    session_state() = default;
+    session_state(std::vector<uint8_t> && d, int64_t now)
+        : data(std::move(d)), created_at(now), updated_at(now) {}
+
+    // Move-only to prevent accidentally copying large blobs
+    session_state(session_state &&) = default;
+    session_state & operator=(session_state &&) = default;
+    session_state(const session_state &) = delete;
+    session_state & operator=(const session_state &) = delete;
+
+    size_t size() const { return data.size(); }
+};
+
 struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
 
@@ -109,6 +132,8 @@ struct server_routes {
     server_http_context::handler_t get_slot_info;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t post_sessions;
+    server_http_context::handler_t get_sessions;
 private:
     std::unique_ptr<server_res_generator> handle_completions_impl(
             const server_http_req & req,
@@ -134,4 +159,10 @@ private:
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    // Server-side session storage
+    std::map<int, session_state> sessions;
+    mutable std::mutex sessions_mutex;
+    std::unique_ptr<server_res_generator> handle_sessions_action(const server_http_req & req, int id_session);
+    std::unique_ptr<server_res_generator> handle_sessions_list(const server_http_req & req);
 };

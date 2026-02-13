@@ -23,6 +23,10 @@
 #include <cstdlib>
 #include <mutex>
 #include <chrono>
+#include <fstream>
+
+#include <unistd.h>
+#include <limits.h>
 
 using json = nlohmann::ordered_json;
 
@@ -1079,6 +1083,7 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_session_remove, 0, 0, 2)
     ZEND_ARG_TYPE_INFO(0, model_name, IS_STRING, 0)
     ZEND_ARG_TYPE_INFO(0, session_id, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, filepath, IS_STRING, 1, "null")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_llama_session_list, 0, 0, 1)
@@ -1325,6 +1330,7 @@ PHP_FUNCTION(swoole_llama_session_get)
 
 // swoole_llama_session_set(string $model_name, int $session_id, string $data): bool
 // Sets the raw binary blob for the given session (import from external storage)
+// If $data starts with "file://" and the file exists, reads from that file instead
 PHP_FUNCTION(swoole_llama_session_set)
 {
     zend_string *z_model;
@@ -1351,8 +1357,62 @@ PHP_FUNCTION(swoole_llama_session_set)
         inst = it->second.get();
     }
 
-    // Persistent copy — SessionState owns persistent strings, PHP owns non-persistent ones
-    zend_string *stored = zend_string_init(ZSTR_VAL(z_data), ZSTR_LEN(z_data), 1);
+    std::string data_str(ZSTR_VAL(z_data), ZSTR_LEN(z_data));
+    zend_string *stored = nullptr;
+
+    // Check for file:// prefix
+    const std::string file_prefix = "file://";
+    if (data_str.size() > file_prefix.size() && data_str.substr(0, file_prefix.size()) == file_prefix) {
+        std::string filepath = data_str.substr(file_prefix.size());
+
+        // Security validation
+        if (!inst->params.slot_save_path.empty()) {
+            // If slot_save_path is set, require file to be in that directory
+            char real_slot_path[PATH_MAX];
+            char real_file_path[PATH_MAX];
+            if (!realpath(inst->params.slot_save_path.c_str(), real_slot_path)) {
+                php_error_docref(nullptr, E_WARNING, "slot_save_path '%s' does not exist", inst->params.slot_save_path.c_str());
+                RETURN_FALSE;
+            }
+            if (!realpath(filepath.c_str(), real_file_path)) {
+                php_error_docref(nullptr, E_WARNING, "File '%s' does not exist", filepath.c_str());
+                RETURN_FALSE;
+            }
+            std::string slot_dir(real_slot_path);
+            std::string file_dir(real_file_path);
+            if (file_dir.find(slot_dir) != 0) {
+                php_error_docref(nullptr, E_WARNING, "File path not within slot_save_path");
+                RETURN_FALSE;
+            }
+        } else {
+            // No slot_save_path - just check file exists
+            if (access(filepath.c_str(), R_OK) != 0) {
+                php_error_docref(nullptr, E_WARNING, "File '%s' does not exist or is not readable", filepath.c_str());
+                RETURN_FALSE;
+            }
+        }
+
+        // Read file contents
+        std::ifstream ifs(filepath, std::ios::binary | std::ios::ate);
+        if (!ifs) {
+            php_error_docref(nullptr, E_WARNING, "Failed to open file '%s'", filepath.c_str());
+            RETURN_FALSE;
+        }
+        size_t file_size = ifs.tellg();
+        ifs.seekg(0, std::ios::beg);
+
+        stored = zend_string_alloc(file_size, 1);
+        if (!ifs.read(ZSTR_VAL(stored), file_size)) {
+            zend_string_release(stored);
+            php_error_docref(nullptr, E_WARNING, "Failed to read file '%s'", filepath.c_str());
+            RETURN_FALSE;
+        }
+        ZSTR_VAL(stored)[file_size] = '\0';
+    } else {
+        // Direct data - persistent copy
+        stored = zend_string_init(ZSTR_VAL(z_data), ZSTR_LEN(z_data), 1);
+    }
+
     int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
 
     {
@@ -1376,15 +1436,19 @@ PHP_FUNCTION(swoole_llama_session_set)
     RETURN_TRUE;
 }
 
-// swoole_llama_session_remove(string $model_name, int $session_id): bool
+// swoole_llama_session_remove(string $model_name, int $session_id, ?string $filepath = null): bool
+// If $filepath is provided, saves the session blob to that file before removing
 PHP_FUNCTION(swoole_llama_session_remove)
 {
     zend_string *z_model;
     zend_long session_id;
+    zend_string *z_filepath = nullptr;
 
-    ZEND_PARSE_PARAMETERS_START(2, 2)
+    ZEND_PARSE_PARAMETERS_START(2, 3)
         Z_PARAM_STR(z_model)
         Z_PARAM_LONG(session_id)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STR_OR_NULL(z_filepath)
     ZEND_PARSE_PARAMETERS_END();
 
     std::string model_name(ZSTR_VAL(z_model), ZSTR_LEN(z_model));
@@ -1412,8 +1476,67 @@ PHP_FUNCTION(swoole_llama_session_remove)
             erased = true;
         }
     }
-    // removed_state destructor (potentially large free) runs here, outside all locks
 
+    // If filepath provided and session was found, save to file before discarding
+    if (erased && z_filepath != nullptr && removed_state.data != nullptr) {
+        std::string filepath(ZSTR_VAL(z_filepath), ZSTR_LEN(z_filepath));
+
+        // Security validation
+        if (!inst->params.slot_save_path.empty()) {
+            // Get the directory part of the target file
+            std::string target_dir;
+            size_t last_sep = filepath.rfind('/');
+            if (last_sep != std::string::npos) {
+                target_dir = filepath.substr(0, last_sep);
+            } else {
+                target_dir = ".";
+            }
+
+            char real_slot_path[PATH_MAX];
+            char real_target_dir[PATH_MAX];
+            if (!realpath(inst->params.slot_save_path.c_str(), real_slot_path)) {
+                php_error_docref(nullptr, E_WARNING, "slot_save_path '%s' does not exist", inst->params.slot_save_path.c_str());
+                // Session already removed, but file save failed
+                RETURN_FALSE;
+            }
+            if (!realpath(target_dir.c_str(), real_target_dir)) {
+                php_error_docref(nullptr, E_WARNING, "Target directory '%s' does not exist", target_dir.c_str());
+                RETURN_FALSE;
+            }
+            std::string slot_path_str(real_slot_path);
+            std::string target_dir_str(real_target_dir);
+            if (target_dir_str.find(slot_path_str) != 0) {
+                php_error_docref(nullptr, E_WARNING, "File path not within slot_save_path");
+                RETURN_FALSE;
+            }
+        } else {
+            // No slot_save_path - just check directory exists and is writable
+            std::string target_dir;
+            size_t last_sep = filepath.rfind('/');
+            if (last_sep != std::string::npos) {
+                target_dir = filepath.substr(0, last_sep);
+            } else {
+                target_dir = ".";
+            }
+            if (access(target_dir.c_str(), W_OK) != 0) {
+                php_error_docref(nullptr, E_WARNING, "Target directory '%s' does not exist or is not writable", target_dir.c_str());
+                RETURN_FALSE;
+            }
+        }
+
+        // Write file
+        std::ofstream ofs(filepath, std::ios::binary | std::ios::trunc);
+        if (!ofs) {
+            php_error_docref(nullptr, E_WARNING, "Failed to open file '%s' for writing", filepath.c_str());
+            RETURN_FALSE;
+        }
+        if (!ofs.write(ZSTR_VAL(removed_state.data), ZSTR_LEN(removed_state.data))) {
+            php_error_docref(nullptr, E_WARNING, "Failed to write to file '%s'", filepath.c_str());
+            RETURN_FALSE;
+        }
+    }
+
+    // removed_state destructor (potentially large free) runs here, outside all locks
     RETURN_BOOL(erased);
 }
 
