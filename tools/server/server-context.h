@@ -7,8 +7,12 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <vector>
 
 struct server_context_impl; // private implementation
 
@@ -87,6 +91,25 @@ struct server_context {
 // forward declarations
 struct server_res_generator;
 
+// Server-side session storage entry (SES1 binary blob with metadata)
+struct session_state {
+    std::vector<uint8_t> data;
+    int64_t created_at = 0;
+    int64_t updated_at = 0;
+
+    session_state() = default;
+    session_state(std::vector<uint8_t> && d, int64_t now)
+        : data(std::move(d)), created_at(now), updated_at(now) {}
+
+    // move-only — sessions are large and we never want to silently copy
+    session_state(session_state &&) = default;
+    session_state & operator=(session_state &&) = default;
+    session_state(const session_state &) = delete;
+    session_state & operator=(const session_state &) = delete;
+
+    size_t size() const { return data.size(); }
+};
+
 struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
 
@@ -120,8 +143,12 @@ struct server_routes {
     server_http_context::handler_t post_embeddings;
     server_http_context::handler_t post_embeddings_oai;
     server_http_context::handler_t post_rerank;
+    server_http_context::handler_t post_classify;
+    server_http_context::handler_t get_slot_info;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t post_sessions;
+    server_http_context::handler_t get_sessions;
 
     // to be used in router mode
     json get_model_info() const;
@@ -136,6 +163,10 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_save_state(const server_http_req & req, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_restore_state(const server_http_req & req, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_tokens(const server_http_req & req, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_context_shift(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
 
     // using unique_ptr to allow late initialization of const
@@ -147,4 +178,10 @@ private:
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    // Server-side session storage (id_session -> SES1 blob)
+    std::map<int, session_state> sessions;
+    mutable std::mutex sessions_mutex;
+    std::unique_ptr<server_res_generator> handle_sessions_action(const server_http_req & req, int id_session);
+    std::unique_ptr<server_res_generator> handle_sessions_list(const server_http_req & req);
 };

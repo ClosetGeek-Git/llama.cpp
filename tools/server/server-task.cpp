@@ -1959,6 +1959,53 @@ json server_task_result_apply_lora::to_json() {
 }
 
 //
+// server_task_result_classify
+//
+
+json server_task_result_classify::to_json() {
+    json arr = json::array();
+    for (const auto & pred : predictions) {
+        arr.push_back({
+            {"label", pred.first},
+            {"score", pred.second},
+        });
+    }
+    std::sort(arr.begin(), arr.end(), [](const json & a, const json & b) {
+        return a["score"].get<float>() > b["score"].get<float>();
+    });
+    return json {
+        {"index",            index},
+        {"predictions",      arr},
+        {"tokens_evaluated", n_tokens},
+    };
+}
+
+//
+// server_task_result_seq_state_get
+//
+
+json server_task_result_seq_state_get::to_json() {
+    return json {
+        {"id_slot", id_slot},
+        {"n_bytes", n_bytes},
+        {"t_ms",    t_ms},
+    };
+}
+
+//
+// server_task_result_seq_state_set
+//
+
+json server_task_result_seq_state_set::to_json() {
+    return json {
+        {"id_slot",      id_slot},
+        {"n_bytes_read", n_bytes_read},
+        {"success",      success},
+        {"t_ms",         t_ms},
+    };
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {

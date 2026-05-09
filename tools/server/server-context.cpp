@@ -16,9 +16,13 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -35,6 +39,36 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// SES1 binary format magic for slot state serialization ("SES1" little-endian)
+static constexpr uint32_t SES1_MAGIC = 0x31534553;
+
+// Used by GET /v1/slots/:id_slot/info to break a slot's token history
+// into message segments separated by the model's end-of-turn token.
+struct message_boundary {
+    int start;
+    int end;
+};
+
+static std::vector<message_boundary> scan_message_boundaries(
+        const llama_token * tokens, int n_tokens, llama_token eot) {
+    std::vector<message_boundary> boundaries;
+    if (eot == LLAMA_TOKEN_NULL || n_tokens <= 0) {
+        return boundaries;
+    }
+    int msg_start = 0;
+    for (int i = 0; i < n_tokens; i++) {
+        if (tokens[i] == eot) {
+            boundaries.push_back({msg_start, i});
+            msg_start = i + 1;
+        }
+    }
+    // trailing tokens after the last EOT (in-progress message)
+    if (msg_start < n_tokens) {
+        boundaries.push_back({msg_start, n_tokens - 1});
+    }
+    return boundaries;
+}
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
     if (pos_min == -1) {
@@ -1750,6 +1784,40 @@ private:
         queue_results.send(std::move(res));
     }
 
+    void send_classify(const server_slot & slot, const llama_batch & batch) {
+        auto res = std::make_unique<server_task_result_classify>();
+        res->id       = slot.task->id;
+        res->index    = slot.task->index;
+        res->n_tokens = slot.task->n_tokens();
+
+        const uint32_t n_cls = llama_model_n_cls_out(model);
+
+        const float * embd = llama_get_embeddings_seq(ctx, slot.id);
+        if (embd == NULL) {
+            // Fallback: find the last token with logits enabled for this seq.
+            for (int i = batch.n_tokens - 1; i >= 0; --i) {
+                if (batch.logits[i] && batch.seq_id[i][0] == slot.id) {
+                    embd = llama_get_embeddings_ith(ctx, i);
+                    break;
+                }
+            }
+        }
+
+        if (embd == NULL) {
+            SLT_ERR(slot, "failed to get embeddings for classification, seq_id = %d\n", slot.id);
+        } else {
+            for (uint32_t c = 0; c < n_cls; ++c) {
+                const char * label = llama_model_cls_label(model, c);
+                std::string label_str = label ? label : ("LABEL_" + std::to_string(c));
+                res->predictions.emplace_back(std::move(label_str), embd[c]);
+            }
+        }
+
+        SLT_DBG(slot, "sending classify result, n_predictions = %zu\n", res->predictions.size());
+
+        queue_results.send(std::move(res));
+    }
+
     //
     // Functions to process the task
     //
@@ -1857,6 +1925,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_CLASSIFY:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -2092,6 +2161,175 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SEQ_STATE_GET:
+                {
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    const int id_slot = task.seq_state_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    const size_t state_size = llama_state_seq_get_size(ctx, slot->id);
+
+                    auto res = std::make_unique<server_task_result_seq_state_get>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->state_data.resize(state_size);
+
+                    const size_t n_written = llama_state_seq_get_data(ctx, res->state_data.data(), state_size, slot->id);
+                    res->state_data.resize(n_written);
+                    res->n_bytes = n_written;
+
+                    res->prompt_tokens = slot->prompt.tokens.get_text_tokens();
+
+                    const int64_t t_end = ggml_time_us();
+                    res->t_ms = (t_end - t_start) / 1000.0;
+
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SEQ_STATE_SET:
+                {
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    const int id_slot = task.seq_state_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    const size_t n_read = llama_state_seq_set_data(ctx,
+                            task.seq_state_action.state_ptr,
+                            task.seq_state_action.state_len,
+                            slot->id);
+                    const bool success = (n_read > 0);
+
+                    if (success) {
+                        slot->prompt.tokens.clear();
+                        if (task.seq_state_action.prompt_tokens_ptr && task.seq_state_action.prompt_tokens_count > 0) {
+                            llama_tokens tokens(
+                                task.seq_state_action.prompt_tokens_ptr,
+                                task.seq_state_action.prompt_tokens_ptr + task.seq_state_action.prompt_tokens_count);
+                            slot->prompt.tokens.insert(tokens);
+                            SRV_INF("slot %d: restored prompt tracking with %zu tokens\n",
+                                    id_slot, task.seq_state_action.prompt_tokens_count);
+                        } else {
+                            SRV_WRN("slot %d: no prompt tokens provided with state restore - prompt cache will be empty\n", id_slot);
+                        }
+                    }
+
+                    const int64_t t_end = ggml_time_us();
+
+                    auto res = std::make_unique<server_task_result_seq_state_set>();
+                    res->id           = task.id;
+                    res->id_slot      = id_slot;
+                    res->n_bytes_read = n_read;
+                    res->success      = success;
+                    res->t_ms         = (t_end - t_start) / 1000.0;
+
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_TOKENS:
+                {
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    const int id_slot = task.slot_tokens_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_tokens>();
+                    res->id           = task.id;
+                    res->id_slot      = id_slot;
+                    res->prompt_tokens = slot->prompt.tokens.get_text_tokens();
+                    res->n_prompt_tokens_processed = slot->n_prompt_tokens_processed;
+
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CONTEXT_SHIFT:
+                {
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    const int id_slot = task.context_shift_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int n_keep    = task.context_shift_action.n_keep;
+                    const int n_discard = task.context_shift_action.n_discard;
+                    const int n_tokens  = slot->prompt.n_tokens();
+
+                    if (n_keep < 0 || n_discard <= 0 || n_keep + n_discard > n_tokens) {
+                        send_error(task,
+                                "Invalid context shift parameters: n_keep=" + std::to_string(n_keep) +
+                                " n_discard=" + std::to_string(n_discard) +
+                                " n_tokens=" + std::to_string(n_tokens),
+                                ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    SRV_INF("slot %d: manual context shift, n_keep = %d, n_discard = %d, n_tokens = %d\n",
+                            id_slot, n_keep, n_discard, n_tokens);
+
+                    llama_memory_seq_rm (llama_get_memory(ctx), slot->id, n_keep,             n_keep + n_discard);
+                    llama_memory_seq_add(llama_get_memory(ctx), slot->id, n_keep + n_discard, n_tokens, -n_discard);
+
+                    {
+                        GGML_ASSERT(!slot->prompt.tokens.has_mtmd);
+
+                        llama_tokens new_tokens = slot->prompt.tokens.get_text_tokens();
+                        for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
+                            new_tokens[i - n_discard] = new_tokens[i];
+                        }
+                        new_tokens.resize(n_tokens - n_discard);
+
+                        slot->prompt.tokens.clear();
+                        slot->prompt.tokens.insert(new_tokens);
+                    }
+
+                    auto res = std::make_unique<server_task_result_context_shift>();
+                    res->id           = task.id;
+                    res->id_slot      = id_slot;
+                    res->success      = true;
+                    res->new_n_tokens = slot->prompt.n_tokens();
+
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -2909,6 +3147,13 @@ private:
                         continue; // continue loop of slots
                     }
 
+                    if (slot.task->type == SERVER_TASK_TYPE_CLASSIFY) {
+                        send_classify(slot, batch_view);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue; // continue loop of slots
+                    }
+
                     GGML_ASSERT(slot.task->need_sampling());
 
                     // prompt evaluated for next-token prediction
@@ -3589,10 +3834,6 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
         std::string id_slot_str = req.get_param("id_slot");
 
@@ -3606,17 +3847,41 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
-        if (action == "save") {
-            return handle_slots_save(req, id_slot);
-        }
-        if (action == "restore") {
-            return handle_slots_restore(req, id_slot);
-        }
-        if (action == "erase") {
+        // File-based actions require --slot-save-path
+        if (action == "save" || action == "restore" || action == "erase") {
+            if (params.slot_save_path.empty()) {
+                res->error(format_error_response("This server does not support file-based slot actions. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            if (action == "save") {
+                return handle_slots_save(req, id_slot);
+            }
+            if (action == "restore") {
+                return handle_slots_restore(req, id_slot);
+            }
             return handle_slots_erase(req, id_slot);
         }
 
-        res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        // In-memory actions require --slots
+        if (!params.endpoint_slots) {
+            res->error(format_error_response("This server does not support slots endpoint. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        if (action == "save-state") {
+            return handle_slots_save_state(req, id_slot);
+        }
+        if (action == "restore-state") {
+            return handle_slots_restore_state(req, id_slot);
+        }
+        if (action == "tokens") {
+            return handle_slots_tokens(req, id_slot);
+        }
+        if (action == "context-shift") {
+            return handle_slots_context_shift(req, id_slot);
+        }
+
+        res->error(format_error_response("Invalid action. Supported: save, restore, erase, save-state, restore-state, tokens, context-shift", ERROR_TYPE_INVALID_REQUEST));
         return res;
     };
 
@@ -4077,6 +4342,145 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->post_classify = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
+            res->error(format_error_response("This server does not support classification. Start it with `--reranking` and a classifier model", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const uint32_t n_cls = llama_model_n_cls_out(ctx_server.model);
+        if (n_cls <= 1) {
+            res->error(format_error_response("Model does not have classification outputs. Use a model trained for sequence classification.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const json body = json::parse(req.body);
+
+        // TEI-compatible: "inputs" can be a single string or an array of strings.
+        std::vector<std::string> inputs;
+        if (!body.contains("inputs")) {
+            res->error(format_error_response("\"inputs\" must be provided", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (body.at("inputs").is_string()) {
+            inputs.push_back(body.at("inputs").get<std::string>());
+        } else if (body.at("inputs").is_array()) {
+            for (const auto & inp : body.at("inputs")) {
+                if (!inp.is_string()) {
+                    res->error(format_error_response("\"inputs\" array must contain strings", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                inputs.push_back(inp.get<std::string>());
+            }
+        } else {
+            res->error(format_error_response("\"inputs\" must be a string or array of strings", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        if (inputs.empty()) {
+            res->error(format_error_response("\"inputs\" must not be empty", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        json responses = json::array();
+        auto & rd = res->rd;
+        {
+            std::vector<server_task> tasks;
+            tasks.reserve(inputs.size());
+            for (size_t i = 0; i < inputs.size(); i++) {
+                server_task task = server_task(SERVER_TASK_TYPE_CLASSIFY);
+                task.id     = rd.get_new_id();
+                task.index  = i;
+                task.tokens = std::move(tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, inputs[i], true, true)[0]);
+                tasks.push_back(std::move(task));
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+
+        auto all_results = rd.wait_for_all(req.should_stop);
+
+        if (all_results.is_terminated) {
+            return res; // connection is closed
+        }
+        if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+        for (auto & result : all_results.results) {
+            GGML_ASSERT(dynamic_cast<server_task_result_classify*>(result.get()) != nullptr);
+            responses.push_back(result->to_json());
+        }
+
+        json root = format_response_classify(body, meta->model_name, responses);
+        res->ok(root);
+        return res;
+    };
+
+    this->get_slot_info = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!params.endpoint_slots) {
+            res->error(format_error_response("This server does not support slots endpoint. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        std::string id_slot_str = req.get_param("id_slot");
+        int id_slot;
+        try {
+            id_slot = std::stoi(id_slot_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SLOT_TOKENS);
+            task.id = rd.get_new_id();
+            task.slot_tokens_action.slot_id = id_slot;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * res_tokens = dynamic_cast<server_task_result_slot_tokens*>(result.get());
+        GGML_ASSERT(res_tokens != nullptr);
+
+        const llama_tokens & tokens = res_tokens->prompt_tokens;
+        const int n_tokens = (int) tokens.size();
+
+        const llama_token eot = llama_vocab_eot(ctx_server.vocab);
+        const auto boundaries = scan_message_boundaries(tokens.data(), n_tokens, eot);
+
+        json messages = json::array();
+        for (size_t i = 0; i < boundaries.size(); i++) {
+            messages.push_back({
+                {"index", (int) i},
+                {"start", boundaries[i].start},
+                {"end",   boundaries[i].end},
+            });
+        }
+
+        res->ok(json{
+            {"id_slot",      id_slot},
+            {"n_tokens",     n_tokens},
+            {"boundary_eot", (int) eot},
+            {"n_messages",   (int) boundaries.size()},
+            {"messages",     messages},
+        });
+        return res;
+    };
+
     this->get_lora_adapters = [this](const server_http_req & req) {
         auto res = create_response();
 
@@ -4137,6 +4541,38 @@ void server_routes::init_routes() {
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
+    };
+
+    // Server-side session storage routes
+    this->post_sessions = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!params.endpoint_slots) {
+            res->error(format_error_response("This server does not support sessions. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        std::string id_session_str = req.get_param("id_session");
+        int id_session;
+        try {
+            id_session = std::stoi(id_session_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid session ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        return handle_sessions_action(req, id_session);
+    };
+
+    this->get_sessions = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!params.endpoint_slots) {
+            res->error(format_error_response("This server does not support sessions. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        return handle_sessions_list(req);
     };
 }
 
@@ -4257,6 +4693,568 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
     res->ok(result->to_json());
+    return res;
+}
+
+// ----------------------------------------------------------------------------
+// In-memory slot state save/restore (SES1 binary format)
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Base64 encoder for the JSON response variant of save-state.
+std::string ses1_base64_encode(const uint8_t * data, size_t len) {
+    static const char b64_table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.resize(((len + 2) / 3) * 4);
+    size_t out_idx = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t) data[i] << 16;
+        if (i + 1 < len) v |= (uint32_t) data[i + 1] << 8;
+        if (i + 2 < len) v |= (uint32_t) data[i + 2];
+        out[out_idx++] = b64_table[(v >> 18) & 0x3F];
+        out[out_idx++] = b64_table[(v >> 12) & 0x3F];
+        out[out_idx++] = (i + 1 < len) ? b64_table[(v >>  6) & 0x3F] : '=';
+        out[out_idx++] = (i + 2 < len) ? b64_table[ v        & 0x3F] : '=';
+    }
+    out.resize(out_idx);
+    return out;
+}
+
+// Base64 decoder. Tolerates padding and whitespace; bails on illegal chars.
+bool ses1_base64_decode(const std::string & b64, std::vector<uint8_t> & out) {
+    static const int b64_lookup[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63, 52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14, 15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40, 41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    };
+    out.clear();
+    out.reserve((b64.size() / 4) * 3);
+    int buf[4] = {-1, -1, -1, -1};
+    int n = 0;
+    for (unsigned char c : b64) {
+        if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+            continue;
+        }
+        int v = b64_lookup[c];
+        if (v < 0) {
+            return false;
+        }
+        buf[n++] = v;
+        if (n == 4) {
+            out.push_back((uint8_t) ((buf[0] << 2) | (buf[1] >> 4)));
+            out.push_back((uint8_t) (((buf[1] & 0xF) << 4) | (buf[2] >> 2)));
+            out.push_back((uint8_t) (((buf[2] & 0x3) << 6) | buf[3]));
+            n = 0;
+        }
+    }
+    if (n == 2) {
+        out.push_back((uint8_t) ((buf[0] << 2) | (buf[1] >> 4)));
+    } else if (n == 3) {
+        out.push_back((uint8_t) ((buf[0] << 2) | (buf[1] >> 4)));
+        out.push_back((uint8_t) (((buf[1] & 0xF) << 4) | (buf[2] >> 2)));
+    }
+    return true;
+}
+
+// Pack {SES1 magic, n_tokens, tokens..., kv_data} into a contiguous blob.
+std::vector<uint8_t> ses1_pack(const llama_tokens & tokens, const std::vector<uint8_t> & kv_data) {
+    const uint32_t n_tokens = (uint32_t) tokens.size();
+    const size_t header_size = sizeof(SES1_MAGIC) + sizeof(n_tokens) + n_tokens * sizeof(llama_token);
+    const size_t total_size = header_size + kv_data.size();
+
+    std::vector<uint8_t> blob(total_size);
+    uint8_t * ptr = blob.data();
+    std::memcpy(ptr, &SES1_MAGIC, sizeof(SES1_MAGIC));
+    ptr += sizeof(SES1_MAGIC);
+    std::memcpy(ptr, &n_tokens, sizeof(n_tokens));
+    ptr += sizeof(n_tokens);
+    if (n_tokens > 0) {
+        std::memcpy(ptr, tokens.data(), n_tokens * sizeof(llama_token));
+        ptr += n_tokens * sizeof(llama_token);
+    }
+    std::memcpy(ptr, kv_data.data(), kv_data.size());
+    return blob;
+}
+
+// Validate a SES1 blob and return pointers into it (kept alive by `blob`).
+// Returns empty optional-style sentinel via *ok = false on error.
+struct ses1_view {
+    bool ok = false;
+    uint32_t n_tokens = 0;
+    const llama_token * tokens_ptr = nullptr;
+    const uint8_t * kv_data = nullptr;
+    size_t kv_len = 0;
+    std::string error;
+};
+
+ses1_view ses1_unpack(const std::vector<uint8_t> & blob) {
+    ses1_view v;
+    const size_t min_header = sizeof(SES1_MAGIC) + sizeof(uint32_t);
+    if (blob.size() < min_header) {
+        v.error = "State data too small";
+        return v;
+    }
+
+    const uint8_t * ptr = blob.data();
+    uint32_t magic;
+    std::memcpy(&magic, ptr, sizeof(magic));
+    ptr += sizeof(magic);
+    if (magic != SES1_MAGIC) {
+        v.error = "Invalid state format (expected SES1 magic)";
+        return v;
+    }
+
+    std::memcpy(&v.n_tokens, ptr, sizeof(v.n_tokens));
+    ptr += sizeof(v.n_tokens);
+
+    const size_t tokens_size = v.n_tokens * sizeof(llama_token);
+    if (blob.size() < min_header + tokens_size) {
+        v.error = "State data truncated (tokens section)";
+        return v;
+    }
+
+    v.tokens_ptr = reinterpret_cast<const llama_token *>(ptr);
+    ptr += tokens_size;
+    v.kv_data = ptr;
+    v.kv_len = blob.size() - (ptr - blob.data());
+    v.ok = true;
+    return v;
+}
+
+} // namespace
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_save_state(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SEQ_STATE_GET);
+        task.id = rd.get_new_id();
+        task.seq_state_action.slot_id = id_slot;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    auto * res_state = dynamic_cast<server_task_result_seq_state_get*>(result.get());
+    GGML_ASSERT(res_state != nullptr);
+
+    std::vector<uint8_t> blob = ses1_pack(res_state->prompt_tokens, res_state->state_data);
+
+    // application/octet-stream: return raw SES1 bytes; otherwise base64 in JSON.
+    auto accept_it = req.headers.find("accept");
+    const std::string accept = (accept_it != req.headers.end()) ? accept_it->second : "";
+
+    if (accept.find("application/octet-stream") != std::string::npos) {
+        res->content_type = "application/octet-stream";
+        res->data.assign(reinterpret_cast<const char *>(blob.data()), blob.size());
+        res->status = 200;
+        return res;
+    }
+
+    res->ok(json{
+        {"id_slot",  id_slot},
+        {"n_tokens", (int) res_state->prompt_tokens.size()},
+        {"n_bytes",  (int) blob.size()},
+        {"t_ms",     res_state->t_ms},
+        {"state",    ses1_base64_encode(blob.data(), blob.size())},
+    });
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_restore_state(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    std::vector<uint8_t> blob;
+
+    auto ct_it = req.headers.find("content-type");
+    const std::string content_type = (ct_it != req.headers.end()) ? ct_it->second : "";
+
+    if (content_type.find("application/octet-stream") != std::string::npos) {
+        blob.assign(req.body.begin(), req.body.end());
+    } else {
+        const json body = json::parse(req.body);
+        if (!body.contains("state") || !body.at("state").is_string()) {
+            res->error(format_error_response("\"state\" must be a base64-encoded string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!ses1_base64_decode(body.at("state").get_ref<const std::string &>(), blob)) {
+            res->error(format_error_response("Invalid base64 in \"state\"", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    }
+
+    ses1_view view = ses1_unpack(blob);
+    if (!view.ok) {
+        res->error(format_error_response(view.error, ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SEQ_STATE_SET);
+        task.id = rd.get_new_id();
+        task.seq_state_action.slot_id              = id_slot;
+        task.seq_state_action.state_ptr            = view.kv_data;
+        task.seq_state_action.state_len            = view.kv_len;
+        task.seq_state_action.prompt_tokens_ptr    = view.tokens_ptr;
+        task.seq_state_action.prompt_tokens_count  = view.n_tokens;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_tokens(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_TOKENS);
+        task.id = rd.get_new_id();
+        task.slot_tokens_action.slot_id = id_slot;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    auto * res_tokens = dynamic_cast<server_task_result_slot_tokens*>(result.get());
+    GGML_ASSERT(res_tokens != nullptr);
+
+    json tokens_arr = json::array();
+    for (const auto & tok : res_tokens->prompt_tokens) {
+        tokens_arr.push_back(tok);
+    }
+
+    res->ok(json{
+        {"id_slot",                   id_slot},
+        {"n_tokens",                  (int) res_tokens->prompt_tokens.size()},
+        {"tokens",                    tokens_arr},
+        {"n_prompt_tokens_processed", res_tokens->n_prompt_tokens_processed},
+    });
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_context_shift(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    const json body = json::parse(req.body);
+    const int n_keep    = json_value(body, "n_keep",    0);
+    const int n_discard = json_value(body, "n_discard", 0);
+
+    if (n_discard <= 0) {
+        res->error(format_error_response("\"n_discard\" must be a positive integer", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_CONTEXT_SHIFT);
+        task.id = rd.get_new_id();
+        task.context_shift_action.slot_id   = id_slot;
+        task.context_shift_action.n_keep    = n_keep;
+        task.context_shift_action.n_discard = n_discard;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    res->ok(result->to_json());
+    return res;
+}
+
+// ----------------------------------------------------------------------------
+// Server-side session storage (id_session -> SES1 blob in memory)
+// ----------------------------------------------------------------------------
+
+std::unique_ptr<server_res_generator> server_routes::handle_sessions_action(const server_http_req & req, int id_session) {
+    auto res = create_response();
+
+    const std::string action   = req.get_param("action");
+    const std::string slot_str = req.get_param("slot");
+
+    if (action == "save") {
+        int id_slot;
+        try {
+            id_slot = std::stoi(slot_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Missing or invalid 'slot' parameter", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SEQ_STATE_GET);
+            task.id = rd.get_new_id();
+            task.seq_state_action.slot_id = id_slot;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * res_state = dynamic_cast<server_task_result_seq_state_get*>(result.get());
+        GGML_ASSERT(res_state != nullptr);
+
+        std::vector<uint8_t> blob = ses1_pack(res_state->prompt_tokens, res_state->state_data);
+        const size_t total_size = blob.size();
+        const uint32_t n_tokens = (uint32_t) res_state->prompt_tokens.size();
+
+        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            auto it = sessions.find(id_session);
+            if (it != sessions.end()) {
+                it->second.data       = std::move(blob);
+                it->second.updated_at = now;
+            } else {
+                sessions.emplace(id_session, session_state(std::move(blob), now));
+            }
+        }
+
+        res->ok(json{
+            {"id_session", id_session},
+            {"id_slot",    id_slot},
+            {"n_tokens",   (int) n_tokens},
+            {"n_bytes",    (int) total_size},
+            {"t_ms",       res_state->t_ms},
+        });
+        return res;
+    }
+
+    if (action == "restore") {
+        int id_slot;
+        try {
+            id_slot = std::stoi(slot_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Missing or invalid 'slot' parameter", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        std::vector<uint8_t> blob;
+        std::string filename;
+
+        if (!req.body.empty()) {
+            try {
+                json body_json = json::parse(req.body);
+                if (body_json.contains("file") && body_json["file"].is_string()) {
+                    filename = body_json["file"].get<std::string>();
+                }
+            } catch (const json::exception &) {
+                // ignore non-JSON bodies; restore-from-map below
+            }
+        }
+
+        if (!filename.empty()) {
+            if (params.slot_save_path.empty()) {
+                res->error(format_error_response("File-based restore requires --slot-save-path", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            if (!fs_validate_filename(filename)) {
+                res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const std::string filepath = params.slot_save_path + filename;
+
+            std::ifstream ifs(filepath, std::ios::binary | std::ios::ate);
+            if (!ifs) {
+                res->error(format_error_response("File not found: " + filename, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const size_t file_size = (size_t) ifs.tellg();
+            ifs.seekg(0, std::ios::beg);
+            blob.resize(file_size);
+            if (!ifs.read(reinterpret_cast<char *>(blob.data()), file_size)) {
+                res->error(format_error_response("Failed to read file: " + filename, ERROR_TYPE_SERVER));
+                return res;
+            }
+        } else {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            auto it = sessions.find(id_session);
+            if (it == sessions.end()) {
+                res->error(format_error_response("Session not found", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            blob = it->second.data; // copy: drop lock before issuing task
+        }
+
+        ses1_view view = ses1_unpack(blob);
+        if (!view.ok) {
+            res->error(format_error_response("Session data corrupted: " + view.error, ERROR_TYPE_SERVER));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SEQ_STATE_SET);
+            task.id = rd.get_new_id();
+            task.seq_state_action.slot_id              = id_slot;
+            task.seq_state_action.state_ptr            = view.kv_data;
+            task.seq_state_action.state_len            = view.kv_len;
+            task.seq_state_action.prompt_tokens_ptr    = view.tokens_ptr;
+            task.seq_state_action.prompt_tokens_count  = view.n_tokens;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * res_set = dynamic_cast<server_task_result_seq_state_set*>(result.get());
+        GGML_ASSERT(res_set != nullptr);
+
+        res->ok(json{
+            {"id_session",   id_session},
+            {"id_slot",      id_slot},
+            {"n_bytes_read", (int) blob.size()},
+            {"success",      true},
+            {"t_ms",         res_set->t_ms},
+        });
+        return res;
+    }
+
+    if (action == "remove") {
+        session_state removed;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            auto it = sessions.find(id_session);
+            if (it != sessions.end()) {
+                removed = std::move(it->second);
+                sessions.erase(it);
+                found = true;
+            }
+        }
+
+        if (!found) {
+            res->error(format_error_response("Session not found", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        std::string filename;
+        if (!req.body.empty()) {
+            try {
+                json body_json = json::parse(req.body);
+                if (body_json.contains("file") && body_json["file"].is_string()) {
+                    filename = body_json["file"].get<std::string>();
+                }
+            } catch (const json::exception &) {
+                // ignore non-JSON bodies
+            }
+        }
+
+        if (!filename.empty()) {
+            if (params.slot_save_path.empty()) {
+                res->error(format_error_response("File-based save requires --slot-save-path", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            if (!fs_validate_filename(filename)) {
+                res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const std::string filepath = params.slot_save_path + filename;
+
+            std::ofstream ofs(filepath, std::ios::binary | std::ios::trunc);
+            if (!ofs) {
+                res->error(format_error_response("Failed to create file: " + filename, ERROR_TYPE_SERVER));
+                return res;
+            }
+            if (!ofs.write(reinterpret_cast<const char *>(removed.data.data()), removed.data.size())) {
+                res->error(format_error_response("Failed to write file: " + filename, ERROR_TYPE_SERVER));
+                return res;
+            }
+
+            res->ok(json{
+                {"id_session", id_session},
+                {"removed",    true},
+                {"file",       filename},
+                {"n_bytes",    (int64_t) removed.data.size()},
+            });
+            return res;
+        }
+
+        res->ok(json{
+            {"id_session", id_session},
+            {"removed",    true},
+        });
+        return res;
+    }
+
+    res->error(format_error_response("Invalid action. Supported: save, restore, remove", ERROR_TYPE_INVALID_REQUEST));
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_sessions_list(const server_http_req &) {
+    auto res = create_response();
+
+    json sessions_array = json::array();
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex);
+        for (const auto & kv : sessions) {
+            sessions_array.push_back(json{
+                {"id",         kv.first},
+                {"size",       (int64_t) kv.second.size()},
+                {"created_at", kv.second.created_at},
+                {"updated_at", kv.second.updated_at},
+            });
+        }
+    }
+
+    res->ok(sessions_array);
     return res;
 }
 
