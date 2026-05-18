@@ -46,6 +46,15 @@ extern char **environ;
 #define CMD_CHILD_TO_ROUTER_SLEEP "cmd_child_to_router:sleep"
 #define CMD_CHILD_TO_ROUTER_INFO  "cmd_child_to_router:info:" // followed by json string
 
+// Env var the router passes to each child carrying a per-spawn random nonce.
+// The child emits CMD_CHILD_TO_ROUTER_READY":"<nonce>"\n" as a full line; the
+// router strict-matches against the same suffix. Without the nonce, a model
+// that happens to log the marker substring (e.g. from --verbose output) could
+// trick the router into marking it ready prematurely. Falling back to legacy
+// substring match when the env is absent preserves backward compat with
+// pre-nonce children.
+#define ENV_ROUTER_NONCE "LLAMA_SERVER_ROUTER_NONCE"
+
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
 #define CHILD_ADDR "127.0.0.1"
@@ -759,6 +768,12 @@ void server_models::load(const std::string & name) {
         throw std::runtime_error("failed to get a port number");
     }
 
+    // Per-spawn ready-marker nonce. Declared at function scope so the lambda
+    // capturing it below can name it. The child must echo this back exactly
+    // for the router to consider it loaded; prevents log-content from spoofing
+    // the ready signal.
+    const std::string nonce = random_string();
+
     inst.subproc = std::make_shared<subprocess_s>();
     {
         SRV_INF("spawning server instance with name=%s on port %d\n", inst.meta.name.c_str(), inst.meta.port);
@@ -768,6 +783,7 @@ void server_models::load(const std::string & name) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        child_env.push_back(std::string(ENV_ROUTER_NONCE) + "=" + nonce);
 
         SRV_INF("%s", "spawning server instance with args:\n");
         for (const auto & arg : child_args) {
@@ -791,9 +807,12 @@ void server_models::load(const std::string & name) {
 
     // start a thread to manage the child process
     // captured variables are guaranteed to be destroyed only after the thread is joined
-    inst.th = std::thread([this, name, child_proc = inst.subproc, port = inst.meta.port, stop_timeout = inst.meta.stop_timeout]() {
+    inst.th = std::thread([this, name, child_proc = inst.subproc, port = inst.meta.port, stop_timeout = inst.meta.stop_timeout, nonce]() {
         FILE * stdin_file = subprocess_stdin(child_proc.get());
         FILE * stdout_file = subprocess_stdout(child_proc.get()); // combined stdout/stderr
+
+        // The exact line the child must emit to be marked ready.
+        const std::string ready_line = std::string(CMD_CHILD_TO_ROUTER_READY) + ":" + nonce;
 
         std::thread log_thread([&]() {
             // read stdout/stderr and forward to main server log
@@ -804,7 +823,15 @@ void server_models::load(const std::string & name) {
                 while (fgets(buffer, vec_buf.size(), stdout_file) != nullptr) {
                     LOG("[%5d] %s", port, buffer);
                     std::string str(buffer);
-                    if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_READY)) {
+                    // Strict full-line match against the nonce-suffixed READY marker.
+                    // Without the nonce, any log line containing the substring
+                    // "cmd_child_to_router:ready" could spoof the ready signal.
+                    // Trim trailing CR/LF before comparison.
+                    size_t len = std::strlen(buffer);
+                    while (len > 0 && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r')) {
+                        len--;
+                    }
+                    if (len == ready_line.size() && std::memcmp(buffer, ready_line.data(), len) == 0) {
                         this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0);
                     } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_INFO)) {
                         this->update_loaded_info(name, str);
@@ -1056,7 +1083,15 @@ std::thread server_models::setup_child_server(const std::function<void(int)> & s
     // send a notification to the router server that a model instance is ready
     common_log_pause(common_log_main());
     fflush(stdout);
-    fprintf(stdout, "%s\n", CMD_CHILD_TO_ROUTER_READY);
+    // Emit the nonce-suffixed marker if the router gave us one; this is what
+    // the strict-match log_thread in the parent expects. If no nonce is set,
+    // emit the bare legacy marker (backward compatible with pre-nonce routers).
+    const char * env_nonce = std::getenv(ENV_ROUTER_NONCE);
+    if (env_nonce != nullptr && *env_nonce != '\0') {
+        fprintf(stdout, "%s:%s\n", CMD_CHILD_TO_ROUTER_READY, env_nonce);
+    } else {
+        fprintf(stdout, "%s\n", CMD_CHILD_TO_ROUTER_READY);
+    }
     fflush(stdout);
     fprintf(stdout, "%s%s\n", CMD_CHILD_TO_ROUTER_INFO, safe_json_to_str(model_info).c_str());
     fflush(stdout);

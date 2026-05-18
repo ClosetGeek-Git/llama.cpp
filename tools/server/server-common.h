@@ -9,18 +9,20 @@
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
 
+#include <cinttypes>
+#include <map>
 #include <string>
 #include <vector>
-#include <cinttypes>
 
 using json = nlohmann::ordered_json;
 
-#define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_INF(slot, fmt, ...) LOG_INF("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_WRN(slot, fmt, ...) LOG_WRN("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_ERR(slot, fmt, ...) LOG_ERR("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_CNT(slot, fmt, ...) LOG_CNT(""                                 fmt,                                                                __VA_ARGS__)
+// note: task ids are uint64_t (server_task::id). When the slot has no task, we print TASK_ID_UNASSIGNED (UINT64_MAX).
+#define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %" PRIu64 " | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : TASK_ID_UNASSIGNED), __VA_ARGS__)
+#define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | task %" PRIu64 " | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : TASK_ID_UNASSIGNED), __VA_ARGS__)
+#define SLT_INF(slot, fmt, ...) LOG_INF("slot %12.*s: id %2d | task %" PRIu64 " | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : TASK_ID_UNASSIGNED), __VA_ARGS__)
+#define SLT_WRN(slot, fmt, ...) LOG_WRN("slot %12.*s: id %2d | task %" PRIu64 " | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : TASK_ID_UNASSIGNED), __VA_ARGS__)
+#define SLT_ERR(slot, fmt, ...) LOG_ERR("slot %12.*s: id %2d | task %" PRIu64 " | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : TASK_ID_UNASSIGNED), __VA_ARGS__)
+#define SLT_CNT(slot, fmt, ...) LOG_CNT(""                                           fmt,                                                                                __VA_ARGS__)
 
 #define SRV_DBG(fmt, ...) LOG_DBG("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SRV_TRC(fmt, ...) LOG_TRC("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -30,6 +32,63 @@ using json = nlohmann::ordered_json;
 #define SRV_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
 using raw_buffer = std::vector<uint8_t>;
+
+//
+// SES1 binary slot-state format
+//
+// Layout: [magic:u32][n_tokens:u32][tokens: n_tokens * sizeof(llama_token)][kv_data: remainder]
+// Magic is ASCII "SES1" stored little-endian (0x31534553). Encode/decode are
+// the canonical helpers shared by /v1/slots/:id/save_state, /v1/slots/:id/restore_state,
+// and the in-memory /sessions/:id session storage. Centralizing them removes the
+// four open-coded duplicates that previously diverged across handlers.
+//
+static constexpr uint32_t SES1_MAGIC      = 0x31534553; // "SES1" LE
+static constexpr size_t   SES1_MAX_TOKENS = 1u << 20;   // hard cap; prevents overflow in size math
+
+// Encode a slot-state blob. Throws std::length_error if prompt_tokens is too large.
+std::vector<uint8_t> ses1_encode(const std::vector<llama_token> & prompt_tokens,
+                                 const std::vector<uint8_t>     & state_data);
+
+// Decoded view into a SES1 blob. The pointers reference memory owned by the
+// caller's blob; they remain valid only as long as the blob is alive.
+struct ses1_decoded {
+    const llama_token * tokens   = nullptr;
+    size_t              n_tokens = 0;
+    const uint8_t *     kv_data  = nullptr;
+    size_t              kv_len   = 0;
+};
+// Returns true on success; on failure, populates `err` with a diagnostic suitable
+// for echoing to a client and leaves `out` undefined.
+bool ses1_decode(const std::vector<uint8_t> & blob, ses1_decoded & out, std::string & err);
+
+//
+// Base64 (standard alphabet, =-padding). Self-contained — does not depend on
+// nlohmann::detail (which is not a stable surface).
+//
+std::string base64_encode(const uint8_t * data, size_t len);
+// Strict decode: rejects out-of-alphabet bytes; requires length % 4 == 0 with
+// up to two '=' padding chars at the end.
+bool        base64_decode(const std::string & b64, std::vector<uint8_t> & out);
+
+//
+// Shared route-template matcher used by ALL transports. Templates use the
+// `:name` syntax for path parameters; matched values are placed in out_params.
+// `prefix` is an optional API-prefix stripped from `path` before matching
+// (corresponds to common_params::api_prefix).
+//
+// Examples:
+//   match_route_template("/sessions/:id_session", "/sessions/u-abc", out, "")
+//     → true; out["id_session"] = "u-abc"
+//   match_route_template("/v1/slots/:id_slot/info", "/v1/slots/0/info", out, "")
+//     → true; out["id_slot"] = "0"
+//   match_route_template("/sessions/:id", "/sessions/foo/bar", out, "")
+//     → false (segment count mismatch)
+//
+std::vector<std::string> split_path(const std::string & p);
+bool match_route_template(const std::string & tmpl,
+                          const std::string & path,
+                          std::map<std::string, std::string> & out_params,
+                          const std::string & prefix = "");
 
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {

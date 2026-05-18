@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -10,6 +11,11 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+
+// Sentinel for an unassigned task id. Assigned ids are produced by
+// server_queue::get_new_id() which is a monotonically increasing atomic counter;
+// reuse is bounded only by uint64_t wraparound (effectively never in practice).
+static constexpr uint64_t TASK_ID_UNASSIGNED = UINT64_MAX;
 
 using json = nlohmann::ordered_json;
 
@@ -128,17 +134,17 @@ struct task_result_state {
 };
 
 struct server_task {
-    int id = -1; // to be filled by server_queue
+    uint64_t id = TASK_ID_UNASSIGNED; // to be filled by server_queue
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
     // used by SERVER_TASK_TYPE_CANCEL
-    int id_target = -1;
-    int id_slot   = -1;
+    uint64_t id_target = TASK_ID_UNASSIGNED;
+    int      id_slot   = -1;
 
     // used by parallel sampling (multiple completions from same prompt)
-    int id_parent  = -1;
+    uint64_t id_parent = TASK_ID_UNASSIGNED;
     // temporary store of child tasks for scheduling
     // note: accessing to elements is invalid after the task is moved to server_slot
     std::vector<server_task> child_tasks;
@@ -240,8 +246,8 @@ struct server_task {
         const json & data);
 
     // utility function
-    static std::unordered_set<int> get_list_id(const std::vector<server_task> & tasks) {
-        std::unordered_set<int> ids(tasks.size());
+    static std::unordered_set<uint64_t> get_list_id(const std::vector<server_task> & tasks) {
+        std::unordered_set<uint64_t> ids(tasks.size());
         for (size_t i = 0; i < tasks.size(); i++) {
             ids.insert(tasks[i].id);
             for (auto & child : tasks[i].child_tasks) {
@@ -251,7 +257,7 @@ struct server_task {
         return ids;
     }
 
-    void add_child(int id_parent, int id_child) {
+    void add_child(uint64_t id_parent, uint64_t id_child) {
         server_task copy;
 
         copy.id        = id_child;
@@ -281,7 +287,7 @@ struct server_task {
     }
 
     bool is_child() const {
-        return id_parent != -1;
+        return id_parent != TASK_ID_UNASSIGNED;
     }
 };
 
@@ -315,8 +321,8 @@ struct result_prompt_progress {
 };
 
 struct server_task_result {
-    int id           = -1;
-    int id_slot      = -1;
+    uint64_t id      = TASK_ID_UNASSIGNED;
+    int      id_slot = -1;
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // to be used for batched tasks

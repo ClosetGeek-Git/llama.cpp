@@ -6,6 +6,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -92,29 +93,59 @@ struct server_context {
 // forward declarations
 struct server_res_generator;
 
-// Server-side session storage entry
+// A single route entry: HTTP method, path template ("/v1/slots/:id_slot/info"),
+// and the handler that serves it. Data-driven route registration lets every
+// transport (cpp-httplib, ZMQ, future) iterate the same list, with route
+// mutations (e.g. router-mode handler swaps in server.cpp) applied once on
+// server_routes BEFORE the list is materialized.
+struct server_route {
+    std::string method;   // "GET" or "POST"
+    std::string path;     // template using :name syntax
+    server_transport_handler_t handler;
+};
+
+// Server-side session storage entry.
+//
+// `data` is held as a shared_ptr<const vector<uint8_t>> so the restore path
+// can take an O(1) refcount bump under `sessions_mutex` and release the lock
+// before the (potentially 100MB) blob read. With a raw vector the lock-held
+// copy serialized all session-restore traffic; with shared_ptr the only
+// lock-held work is finding the entry and incrementing the refcount.
+//
+// The blob is immutable once stored (replace = whole-blob swap), so const-ptr
+// sharing is safe — readers see a snapshot even if a concurrent save bumps in
+// a new entry.
 struct session_state {
-    std::vector<uint8_t> data;  // SES1-format blob
+    std::shared_ptr<const std::vector<uint8_t>> data;  // SES1-format blob
     int64_t created_at = 0;
     int64_t updated_at = 0;
+    bool    pinned     = false;  // skipped during LRU eviction (see S2)
 
     session_state() = default;
-    session_state(std::vector<uint8_t> && d, int64_t now)
+    session_state(std::shared_ptr<const std::vector<uint8_t>> d, int64_t now)
         : data(std::move(d)), created_at(now), updated_at(now) {}
 
-    // Move-only to prevent accidentally copying large blobs
+    // Movable AND copyable: copy is O(1) (refcount bump only). The previous
+    // move-only contract existed to prevent accidental O(N) vector copies;
+    // that concern goes away under shared_ptr.
     session_state(session_state &&) = default;
     session_state & operator=(session_state &&) = default;
-    session_state(const session_state &) = delete;
-    session_state & operator=(const session_state &) = delete;
+    session_state(const session_state &) = default;
+    session_state & operator=(const session_state &) = default;
 
-    size_t size() const { return data.size(); }
+    size_t size() const { return data ? data->size() : 0; }
 };
 
 struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
 
     void init_routes();
+
+    // Materialize the route table. Call ONCE per process, after any handler
+    // mutations (e.g. router-mode proxy swaps in server.cpp) are in place but
+    // BEFORE any transport's get()/post() registration. Returns by value so
+    // the transport can move it into its own internal map.
+    std::vector<server_route> routes() const;
 
     // note: this is not thread-safe and can only when ctx_http.is_ready is false
     void update_meta(const server_context & ctx_server) {
@@ -150,6 +181,8 @@ struct server_routes {
     server_http_context::handler_t post_lora_adapters;
     server_http_context::handler_t post_sessions;
     server_http_context::handler_t get_sessions;
+    server_http_context::handler_t post_session_pin;
+    server_http_context::handler_t post_session_unpin;
 
     // to be used in router mode (upstream addition)
     json get_model_info() const;
@@ -161,6 +194,33 @@ private:
             const json & data,
             const std::vector<raw_buffer> & files,
             task_response_type res_type);
+
+    // S3: session block carried alongside a completion request. The PHP/Caelus
+    // frontend uses this to migrate a user from one host's warm tier to
+    // another: include restore_key on the first turn after a host switch
+    // (server inlines the Redis-fetched blob), and save_key_after to write the
+    // post-completion KV state back to the warm tier (PHP optionally cools to
+    // Redis via the separate /sessions endpoints).
+    struct session_action {
+        std::string restore_key;     // session id to restore into id_slot before dispatch
+        std::string save_key_after;  // session id to save id_slot's state into post-completion
+        bool        evict_after = false;  // drop the warm copy after save (PHP holds canonical)
+        bool        present     = false;  // true if the body had a "session" field at all
+    };
+    // Read and strip the "session" object from body. Idempotent on inputs
+    // without the field — returns an action with present=false.
+    static session_action extract_session_action(json & body);
+
+    // Wraps handle_completions_impl with the pre-restore and post-save hooks.
+    // Returns an error response if the restore fails. Stream save failures
+    // log only; the response is already on the wire.
+    std::unique_ptr<server_res_generator> handle_completions_with_session(
+            const server_http_req & req,
+            server_task_type type,
+            const json & data,
+            const std::vector<raw_buffer> & files,
+            task_response_type res_type,
+            const session_action & sa);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
@@ -180,9 +240,36 @@ private:
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
 
-    // Server-side session storage
-    std::map<int, session_state> sessions;
+    // Server-side session storage (in-process "warm" tier; PHP/Caelus drives
+    // the "cool" Redis tier on top of this surface). Keyed by string so the
+    // PHP frontend can index directly by user_id (Colyseus presence pattern)
+    // without an int translation layer.
+    std::map<std::string, session_state> sessions;
     mutable std::mutex sessions_mutex;
-    std::unique_ptr<server_res_generator> handle_sessions_action(const server_http_req & req, int id_session);
+    // Running total of bytes held in `sessions`. Updated alongside insertions
+    // and removals while sessions_mutex is held; Phase 3 (S2) consumes this to
+    // enforce --sessions-max-bytes. Atomic so external observers can read it
+    // without acquiring sessions_mutex.
+    std::atomic<size_t> sessions_total_bytes_{0};
+    std::unique_ptr<server_res_generator> handle_sessions_action(const server_http_req & req, const std::string & id_session);
     std::unique_ptr<server_res_generator> handle_sessions_list(const server_http_req & req);
+
+    // S2: enforce params.sessions_max_bytes by LRU-evicting unpinned entries.
+    // Caller must hold sessions_mutex. Returns the number of entries evicted.
+    // No-op when sessions_max_bytes == 0 (unbounded).
+    size_t evict_sessions_until_under_budget();
+
+    // S3: synchronous one-shot helpers used by completion handlers consuming
+    // the optional "session" body block. Each posts a single task via a
+    // one-off response_reader and waits for completion. On failure, returns
+    // false; the caller decides whether to surface the error (pre-completion
+    // restore failures abort the request; post-completion save failures only
+    // log, since the response is already on the wire).
+    bool perform_session_restore(const std::string & key, int id_slot,
+                                 const std::function<bool()> & should_stop,
+                                 std::string & err_out);
+    bool perform_session_save  (const std::string & key, int id_slot,
+                                 bool evict_after,
+                                 const std::function<bool()> & should_stop,
+                                 std::string & err_out);
 };

@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-http.h"
+#include "server-zmq.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-tools.h"
@@ -19,21 +20,102 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #endif
+
+// Shutdown is mediated by a self-pipe so the OS signal handler stays
+// async-signal-safe: it only calls write() and _exit() (both ASS).
+// The actual shutdown_handler (std::function, may allocate, takes locks) runs
+// on a normal thread that drains the pipe.
+//
+// On Windows the console handler already runs on its own (non-signal) thread,
+// so calling std::function from it is safe; we keep the direct-call path there.
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
+#if defined(_WIN32)
 static inline void signal_handler(int signal) {
+    // Windows console handler thread context: std::function call is safe here.
     if (is_terminating.test_and_set()) {
-        // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
-        // this is for better developer experience, we can remove when the server is stable enough
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
+        _exit(1);
     }
-
-    shutdown_handler(signal);
+    if (shutdown_handler) {
+        shutdown_handler(signal);
+    }
 }
+#else
+// POSIX: self-pipe + listener thread.
+static int shutdown_pipe_fd[2] = {-1, -1};
+
+static void signal_handler_posix(int signo) {
+    if (is_terminating.test_and_set()) {
+        // second signal: force exit. write+_exit are async-signal-safe; printf/exit are not.
+        static const char msg[] = "Received second interrupt, terminating immediately.\n";
+        ssize_t n = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        (void) n;
+        _exit(1);
+    }
+    // Write one byte to the pipe; the listener thread (running in normal context)
+    // will read it and invoke shutdown_handler. write() to a pipe of <= PIPE_BUF
+    // bytes is atomic and async-signal-safe.
+    unsigned char byte = (unsigned char)(signo & 0xFF);
+    ssize_t n = write(shutdown_pipe_fd[1], &byte, 1);
+    (void) n; // best effort; pipe full just drops the redundant signal
+}
+
+static void install_posix_signal_handlers() {
+    // create the self-pipe before installing sigaction so the handler can never
+    // race against an uninitialized pipe fd
+    if (pipe(shutdown_pipe_fd) != 0) {
+        LOG_ERR("%s: failed to create shutdown pipe: %s\n", __func__, strerror(errno));
+        return;
+    }
+    // close-on-exec so children don't inherit; non-blocking on the write end so
+    // multiple rapid signals don't deadlock the kernel buffer.
+    for (int i = 0; i < 2; i++) {
+        int flags = fcntl(shutdown_pipe_fd[i], F_GETFD);
+        if (flags >= 0) fcntl(shutdown_pipe_fd[i], F_SETFD, flags | FD_CLOEXEC);
+    }
+    int wflags = fcntl(shutdown_pipe_fd[1], F_GETFL);
+    if (wflags >= 0) fcntl(shutdown_pipe_fd[1], F_SETFL, wflags | O_NONBLOCK);
+
+    struct sigaction sa{};
+    sa.sa_handler = signal_handler_posix;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // do NOT set SA_RESTART; we want read() in the listener to be EINTR-able if needed
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+}
+
+// Blocks the calling thread until a signal byte arrives on the pipe, then runs
+// shutdown_handler in normal (non-signal) context. Returns when the pipe is
+// closed or read() fails terminally.
+static void shutdown_pipe_listener_loop() {
+    while (true) {
+        unsigned char byte = 0;
+        ssize_t n = read(shutdown_pipe_fd[0], &byte, 1);
+        if (n == 1) {
+            if (shutdown_handler) {
+                shutdown_handler((int)byte);
+            }
+            return; // shutdown_handler should drive the rest of teardown
+        }
+        if (n == 0) {
+            return; // EOF: pipe closed
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        LOG_ERR("%s: read from shutdown pipe failed: %s\n", __func__, strerror(errno));
+        return;
+    }
+}
+#endif
 
 // wrapper function that handles exceptions and logs errors
 // this is to make sure handler_t never throws exceptions; instead, it returns an error response
@@ -115,10 +197,30 @@ int main(int argc, char ** argv) {
     // struct that contains llama context and inference
     server_context ctx_server;
 
-    server_http_context ctx_http;
-    if (!ctx_http.init(params)) {
-        SRV_ERR("%s", "failed to initialize HTTP server\n");
+    // Validate that at least one transport is enabled. Both are allowed
+    // simultaneously and serve the same handler table.
+    if (!params.enable_http && !params.enable_zmq) {
+        LOG_ERR("%s: at least one transport must be enabled (--enable-http or --enable-zmq)\n", __func__);
         return 1;
+    }
+
+    // Declare both transports unconditionally so they're in scope for shutdown
+    // logic; only init/start them if requested.
+    server_http_context ctx_http;
+    server_zmq_context  ctx_zmq;
+
+    if (params.enable_http && !ctx_http.init(params)) {
+        LOG_ERR("%s: failed to initialize HTTP transport\n", __func__);
+        return 1;
+    }
+    if (params.enable_zmq) {
+        ctx_zmq.bind_endpoints = params.zmq_bind_endpoints;
+        ctx_zmq.n_workers      = params.zmq_workers;
+        ctx_zmq.hwm            = params.zmq_hwm;
+        if (!ctx_zmq.init(params)) {
+            LOG_ERR("%s: failed to initialize ZMQ transport\n", __func__);
+            return 1;
+        }
     }
 
     //
@@ -166,80 +268,71 @@ int main(int argc, char ** argv) {
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
-
-        ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
-        ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
     }
 
-    ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
-    ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
-    ctx_http.post("/props",                    ex_wrapper(routes.post_props));
-    ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)
-    ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models)); // public endpoint (no API key check)
-    ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
-    ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
-    ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
-    ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
-    ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
-    ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
-    ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
-    ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
-    ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
-    ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
-    ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
-    ctx_http.post("/embeddings",               ex_wrapper(routes.post_embeddings));
-    ctx_http.post("/v1/embeddings",            ex_wrapper(routes.post_embeddings_oai));
-    ctx_http.post("/rerank",                   ex_wrapper(routes.post_rerank));
-    ctx_http.post("/reranking",                ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/rerank",                ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
-    ctx_http.post("/classify",                 ex_wrapper(routes.post_classify));
-    ctx_http.post("/v1/classify",              ex_wrapper(routes.post_classify));
-    ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
-    ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
-    ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
-    // LoRA adapters hotswap
-    ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
-    ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
-    // Save & load slots
-    ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
-    ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
-    ctx_http.get ("/v1/slots/:id_slot/info",   ex_wrapper(routes.get_slot_info));
-    // Server-side session storage
-    ctx_http.post("/sessions/:id_session",     ex_wrapper(routes.post_sessions));
-    ctx_http.get ("/sessions",                 ex_wrapper(routes.get_sessions));
-
-    // Google Cloud Platform (Vertex AI) compat
-    ctx_http.register_gcp_compat();
-
-    // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
-    // Supports both new ui_mcp_proxy and deprecated webui_mcp_proxy fields
-    if (params.ui_mcp_proxy || params.webui_mcp_proxy) {
-        SRV_WRN("%s", "-----------------\n");
-        SRV_WRN("%s", "CORS proxy is enabled, do not expose server to untrusted environments\n");
-        SRV_WRN("%s", "This feature is EXPERIMENTAL and may be removed or changed in future versions\n");
-        SRV_WRN("%s", "-----------------\n");
-        ctx_http.get ("/cors-proxy",      ex_wrapper(proxy_handler_get));
-        ctx_http.post("/cors-proxy",      ex_wrapper(proxy_handler_post));
-    }
-    // EXPERIMENTAL built-in tools
-    if (!params.server_tools.empty()) {
-        try {
-            tools.setup(params.server_tools);
-        } catch (const std::exception & e) {
-            SRV_ERR("tools setup failed: %s\n", e.what());
-            return 1;
+    // Materialize the route table AFTER any router-mode handler swaps so the
+    // canonical list reflects the current bindings. Then register on every
+    // ENABLED transport — both can coexist.
+    const auto route_list = routes.routes();
+    for (const auto & r : route_list) {
+        const auto wrapped = ex_wrapper(r.handler);
+        if (params.enable_http) {
+            if (r.method == "GET") ctx_http.get(r.path, wrapped);
+            else                    ctx_http.post(r.path, wrapped);
         }
-        SRV_WRN("%s", "-----------------\n");
-        SRV_WRN("%s", "Built-in tools are enabled, do not expose server to untrusted environments\n");
-        SRV_WRN("%s", "This feature is EXPERIMENTAL and may be changed in the future\n");
-        SRV_WRN("%s", "-----------------\n");
-        ctx_http.get ("/tools",           ex_wrapper(tools.handle_get));
-        ctx_http.post("/tools",           ex_wrapper(tools.handle_post));
+        if (params.enable_zmq) {
+            if (r.method == "GET") ctx_zmq.get(r.path, wrapped);
+            else                    ctx_zmq.post(r.path, wrapped);
+        }
+    }
+    // Router-only endpoints: bypass server_routes since the load/unload
+    // handlers belong to the optionally-constructed models_routes.
+    if (is_router_server) {
+        const auto load_wrap   = ex_wrapper(models_routes->post_router_models_load);
+        const auto unload_wrap = ex_wrapper(models_routes->post_router_models_unload);
+        if (params.enable_http) {
+            ctx_http.post("/models/load",   load_wrap);
+            ctx_http.post("/models/unload", unload_wrap);
+        }
+        if (params.enable_zmq) {
+            ctx_zmq.post("/models/load",   load_wrap);
+            ctx_zmq.post("/models/unload", unload_wrap);
+        }
+    }
+
+    // HTTP-only post-route hooks: GCP-compat, CORS proxy, and built-in tools.
+    // These are HTTP-shaped features (regex routing, browser/CORS, multipart
+    // form uploads) and don't map onto the ZMQ envelope wire format.
+    if (params.enable_http) {
+        // Google Cloud Platform (Vertex AI) compat
+        // Must be called AFTER all other API routes are registered
+        ctx_http.register_gcp_compat();
+
+        // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
+        // Supports both new ui_mcp_proxy and deprecated webui_mcp_proxy fields
+        if (params.ui_mcp_proxy || params.webui_mcp_proxy) {
+            SRV_WRN("%s", "-----------------\n");
+            SRV_WRN("%s", "CORS proxy is enabled, do not expose server to untrusted environments\n");
+            SRV_WRN("%s", "This feature is EXPERIMENTAL and may be removed or changed in future versions\n");
+            SRV_WRN("%s", "-----------------\n");
+            ctx_http.get ("/cors-proxy",      ex_wrapper(proxy_handler_get));
+            ctx_http.post("/cors-proxy",      ex_wrapper(proxy_handler_post));
+        }
+        // EXPERIMENTAL built-in tools
+        if (!params.server_tools.empty()) {
+            try {
+                tools.setup(params.server_tools);
+            } catch (const std::exception & e) {
+                SRV_ERR("tools setup failed: %s\n", e.what());
+                return 1;
+            }
+            SRV_WRN("%s", "-----------------\n");
+            SRV_WRN("%s", "Built-in tools are enabled, do not expose server to untrusted environments\n");
+            SRV_WRN("%s", "This feature is EXPERIMENTAL and may be changed in the future\n");
+            SRV_WRN("%s", "-----------------\n");
+            ctx_http.get ("/tools",           ex_wrapper(tools.handle_get));
+            ctx_http.post("/tools",           ex_wrapper(tools.handle_post));
+        }
     }
 
     //
@@ -251,38 +344,57 @@ int main(int argc, char ** argv) {
     if (is_router_server) {
         SRV_INF("%s", "starting router server, no model will be loaded in this process\n");
 
-        clean_up = [&models_routes]() {
+        clean_up = [&models_routes, &ctx_http, &ctx_zmq, &params]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
+            // Stop transports first (idempotent) so no new requests arrive,
+            // then drain the model manager.
+            if (params.enable_http) ctx_http.stop();
+            if (params.enable_zmq)  ctx_zmq.stop();
             if (models_routes.has_value()) {
                 models_routes->models.unload_all();
             }
             llama_backend_free();
         };
 
-        if (!ctx_http.start()) {
+        if (params.enable_http && !ctx_http.start()) {
             clean_up();
             SRV_ERR("%s", "exiting due to HTTP server error\n");
             return 1;
         }
-        ctx_http.is_ready.store(true);
+        if (params.enable_zmq && !ctx_zmq.start()) {
+            clean_up();
+            LOG_ERR("%s: exiting due to ZMQ server error\n", __func__);
+            return 1;
+        }
+        if (params.enable_http) ctx_http.is_ready.store(true);
+        if (params.enable_zmq)  ctx_zmq.is_ready.store(true);
 
         shutdown_handler = [&](int) {
-            ctx_http.stop();
+            if (params.enable_http) ctx_http.stop();
+            if (params.enable_zmq)  ctx_zmq.stop();
         };
 
     } else {
-        // setup clean up function, to be called before exit
-        clean_up = [&ctx_http, &ctx_server]() {
+        // setup clean up function, to be called before exit. Order is
+        // load-bearing: stop transports first (no new requests), then terminate
+        // the inference loop (drains queue_results so blocked recv() unwinds).
+        clean_up = [&ctx_http, &ctx_zmq, &ctx_server, &params]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
-            ctx_http.stop();
+            if (params.enable_http) ctx_http.stop();
+            if (params.enable_zmq)  ctx_zmq.stop();
             ctx_server.terminate();
             llama_backend_free();
         };
 
-        // start the HTTP server before loading the model to be able to serve /health requests
-        if (!ctx_http.start()) {
+        // start the transports before loading the model to be able to serve /health requests
+        if (params.enable_http && !ctx_http.start()) {
             clean_up();
             SRV_ERR("%s", "exiting due to HTTP server error\n");
+            return 1;
+        }
+        if (params.enable_zmq && !ctx_zmq.start()) {
+            clean_up();
+            LOG_ERR("%s: exiting due to ZMQ server error\n", __func__);
             return 1;
         }
 
@@ -305,24 +417,28 @@ int main(int argc, char ** argv) {
         }
 
         routes.update_meta(ctx_server);
-        ctx_http.is_ready.store(true);
+        if (params.enable_http) ctx_http.is_ready.store(true);
+        if (params.enable_zmq)  ctx_zmq.is_ready.store(true);
 
         SRV_INF("%s", "model loaded\n");
 
         shutdown_handler = [&](int) {
-            // this will unblock start_loop()
+            // Stop transports first (refuses new requests immediately), then
+            // terminate the inference loop. ctx_server.terminate() also
+            // terminates queue_results, so any in-flight handler thread
+            // blocked in recv() unwinds with nullptr instead of hanging.
+            if (params.enable_http) ctx_http.stop();
+            if (params.enable_zmq)  ctx_zmq.stop();
             ctx_server.terminate();
         };
     }
 
-    // TODO: refactor in common/console
+    // Install signal handlers. On POSIX this creates the self-pipe and starts
+    // a listener thread; the OS handler itself only writes to the pipe.
+    std::thread shutdown_listener_thread;
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
-    struct sigaction sigint_action;
-    sigint_action.sa_handler = signal_handler;
-    sigemptyset (&sigint_action.sa_mask);
-    sigint_action.sa_flags = 0;
-    sigaction(SIGINT, &sigint_action, NULL);
-    sigaction(SIGTERM, &sigint_action, NULL);
+    install_posix_signal_handlers();
+    shutdown_listener_thread = std::thread(shutdown_pipe_listener_loop);
 #elif defined (_WIN32)
     auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
         return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
@@ -331,14 +447,37 @@ int main(int argc, char ** argv) {
 #endif
 
     if (is_router_server) {
-        SRV_INF("router server is listening on %s\n", ctx_http.listening_address.c_str());
+        const std::string addr = params.enable_http ? ctx_http.listening_address : ctx_zmq.listening_address;
+        SRV_INF("router server is listening on %s\n", addr.c_str());
         SRV_WRN("%s", "NOTE: router mode is experimental\n");
         SRV_WRN("%s", "      it is not recommended to use this mode in untrusted environments\n");
+
+        // Block main until shutdown is requested. We rebuild shutdown_handler
+        // here to additionally signal a condvar; main wakes, then runs
+        // clean_up to finalize teardown. This works uniformly whether HTTP,
+        // ZMQ, or both are enabled (no dependency on which thread is joinable).
+        std::mutex              shutdown_mu;
+        std::condition_variable shutdown_cv;
+        bool                    shutdown_requested = false;
+        shutdown_handler = [&](int) {
+            if (params.enable_http) ctx_http.stop();
+            if (params.enable_zmq)  ctx_zmq.stop();
+            {
+                std::lock_guard<std::mutex> lk(shutdown_mu);
+                shutdown_requested = true;
+            }
+            shutdown_cv.notify_all();
+        };
+
+        {
+            std::unique_lock<std::mutex> lk(shutdown_mu);
+            shutdown_cv.wait(lk, [&]{ return shutdown_requested; });
+        }
+        // wait for httplib listener to drain (no-op if HTTP disabled)
         if (ctx_http.thread.joinable()) {
-            ctx_http.thread.join(); // keep the main thread alive
+            ctx_http.thread.join();
         }
 
-        // when the HTTP server stops, clean up and exit
         clean_up();
     } else {
         SRV_INF("server is listening on %s\n", ctx_http.listening_address.c_str());
@@ -366,6 +505,22 @@ int main(int argc, char ** argv) {
             common_memory_breakdown_print(ll_ctx);
         }
     }
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    // unblock the shutdown listener so it can exit cleanly. closing the write
+    // end gives read() a 0-return EOF.
+    if (shutdown_pipe_fd[1] >= 0) {
+        close(shutdown_pipe_fd[1]);
+        shutdown_pipe_fd[1] = -1;
+    }
+    if (shutdown_listener_thread.joinable()) {
+        shutdown_listener_thread.join();
+    }
+    if (shutdown_pipe_fd[0] >= 0) {
+        close(shutdown_pipe_fd[0]);
+        shutdown_pipe_fd[0] = -1;
+    }
+#endif
 
     return 0;
 }

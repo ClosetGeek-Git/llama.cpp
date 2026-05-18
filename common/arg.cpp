@@ -3046,6 +3046,54 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_prompt = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PROMPT"));
+    // --- Transport selection ---
+    add_opt(common_arg(
+        {"--enable-http"},
+        {"--no-enable-http"},
+        string_format("enable the cpp-httplib transport (default: %s)", params.enable_http ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.enable_http = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENABLE_HTTP"));
+    add_opt(common_arg(
+        {"--enable-zmq"},
+        {"--no-enable-zmq"},
+        string_format("enable the ZMQ transport alongside HTTP (default: %s)", params.enable_zmq ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.enable_zmq = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENABLE_ZMQ"));
+    add_opt(common_arg(
+        {"--zmq-bind"}, "ENDPOINT",
+        "ZMQ ROUTER bind endpoint (repeatable; e.g. ipc:///tmp/x.sock or tcp://127.0.0.1:5555). "
+        "Default if unset: ipc:///tmp/llama-server-<PID>.sock",
+        [](common_params & params, const std::string & v) {
+            params.zmq_bind_endpoints.push_back(v);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ZMQ_BIND"));
+    add_opt(common_arg(
+        {"--zmq-workers"}, "N",
+        string_format("number of ZMQ worker threads (default: 0 = auto, derived as n_parallel+2)"),
+        [](common_params & params, int value) {
+            params.zmq_workers = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ZMQ_WORKERS"));
+    add_opt(common_arg(
+        {"--zmq-hwm"}, "N",
+        string_format("ZMQ high-water-mark (SNDHWM/RCVHWM) per socket (default: %d)", params.zmq_hwm),
+        [](common_params & params, int value) {
+            params.zmq_hwm = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ZMQ_HWM"));
+    // --- Session storage ---
+    add_opt(common_arg(
+        {"--sessions-max-bytes"}, "N",
+        string_format("Maximum total bytes held in the in-process /sessions store; LRU eviction when "
+                      "exceeded (default: %lld = unbounded)", (long long)params.sessions_max_bytes),
+        [](common_params & params, int value) {
+            params.sessions_max_bytes = (int64_t)value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SESSIONS_MAX_BYTES"));
     add_opt(common_arg(
         {"--cache-reuse"}, "N",
         string_format(

@@ -16,6 +16,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -37,8 +38,7 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// SES1 binary format magic for slot state serialization
-static constexpr uint32_t SES1_MAGIC = 0x31534553; // \"SES1\" in little-endian
+// SES1 magic and (de)coders are now in server-common.h / .cpp — see ses1_encode/ses1_decode.
 
 // Message boundary detection for slot info endpoint
 struct message_boundary {
@@ -1605,8 +1605,8 @@ private:
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
     }
 
-    void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0) {
-        SRV_ERR("task id = %d, error: %s\n", id_task, error.c_str());
+    void send_error(const uint64_t id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0) {
+        SRV_ERR("task id = %" PRIu64 ", error: %s\n", id_task, error.c_str());
 
         if (type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
             GGML_ASSERT(n_ctx > 0 && n_prompt_tokens > 0);
@@ -1623,7 +1623,7 @@ private:
     }
 
     // if multimodal is enabled, send an error and return false
-    bool check_no_mtmd(const int id_task) {
+    bool check_no_mtmd(const uint64_t id_task) {
         if (mctx) {
             send_error(id_task, "This feature is not supported by multimodal", ERROR_TYPE_NOT_SUPPORTED);
             return false;
@@ -1816,14 +1816,14 @@ private:
         res->index    = slot.task->index;
         res->n_tokens = slot.task->n_tokens();
 
-        const uint32_t n_cls = llama_model_n_cls_out(model);
+        const uint32_t n_cls = llama_model_n_cls_out(model_tgt);
 
-        const float * embd = llama_get_embeddings_seq(ctx, slot.id);
+        const float * embd = llama_get_embeddings_seq(ctx_tgt, slot.id);
         if (embd == NULL) {
             // Fallback: find the last token with logits enabled
             for (int i = batch.n_tokens - 1; i >= 0; --i) {
                 if (batch.logits[i] && batch.seq_id[i][0] == slot.id) {
-                    embd = llama_get_embeddings_ith(ctx, i);
+                    embd = llama_get_embeddings_ith(ctx_tgt, i);
                     break;
                 }
             }
@@ -1833,7 +1833,7 @@ private:
             SLT_ERR(slot, "failed to get embeddings for classification, seq_id = %d\n", slot.id);
         } else {
             for (uint32_t c = 0; c < n_cls; ++c) {
-                const char * label = llama_model_cls_label(model, c);
+                const char * label = llama_model_cls_label(model_tgt, c);
                 std::string label_str = label ? label : ("LABEL_" + std::to_string(c));
                 res->predictions.emplace_back(label_str, embd[c]);
             }
@@ -1885,9 +1885,9 @@ private:
         GGML_ASSERT(parent_task.is_parent());
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
 
-        int id_parent = parent_task.id;
+        uint64_t id_parent = parent_task.id;
 
-        SRV_INF("launching slots for parent task id_task = %d with %zu child tasks\n", id_parent, parent_task.child_tasks.size());
+        SRV_INF("launching slots for parent task id_task = %" PRIu64 " with %zu child tasks\n", id_parent, parent_task.child_tasks.size());
 
         // to be called in case of failure to release all launched slots
         auto release_slots = [this, id_parent]() {
@@ -1905,9 +1905,9 @@ private:
         size_t idx = 0;
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
         for (auto * slot : child_slots) {
-            int id_child = parent_task.child_tasks[idx].id;
+            uint64_t id_child = parent_task.child_tasks[idx].id;
             if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
-                SRV_ERR("failed to launch slot with child task, id_task = %d\n", id_child);
+                SRV_ERR("failed to launch slot with child task, id_task = %" PRIu64 "\n", id_child);
                 release_slots();
                 return false;
             }
@@ -1916,7 +1916,7 @@ private:
 
         // finally, launch the parent task
         if (!launch_slot_with_task(parent_slot, std::move(parent_task))) {
-            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_parent);
+            SRV_ERR("failed to launch slot with task, id_task = %" PRIu64 "\n", id_parent);
             release_slots();
             return false;
         }
@@ -1965,8 +1965,8 @@ private:
                         }
                     }
 
-                    const int id_slot = task.id_slot;
-                    const int id_task = task.id;
+                    const int      id_slot = task.id_slot;
+                    const uint64_t id_task = task.id;
 
                     server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
 
@@ -1976,14 +1976,14 @@ private:
 
                     if (slot == nullptr) {
                         // if no slot is available, we defer this task for processing later
-                        SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                        SRV_DBG("no slot is available, defer task, id_task = %" PRIu64 "\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %" PRIu64 "\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -1993,16 +1993,16 @@ private:
                         size_t n_child_tasks = task.child_tasks.size();
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
-                            SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+                            SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %" PRIu64 "\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
-                            SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
+                            SRV_ERR("failed to launch slot with parent task, id_task = %" PRIu64 "\n", id_task);
                             break; // drop the task
                         }
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                        SRV_ERR("failed to launch slot with task, id_task = %" PRIu64 "\n", id_task);
                         break; // drop the task
                     }
 
@@ -2090,7 +2090,7 @@ private:
                     }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %" PRIu64 "\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -2128,7 +2128,7 @@ private:
                     }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %" PRIu64 "\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -2177,7 +2177,7 @@ private:
                     }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %" PRIu64 "\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -2202,21 +2202,21 @@ private:
                         break;
                     }
                     if (slot->is_processing()) {
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %" PRIu64 "\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
                     const int64_t t_start = ggml_time_us();
 
-                    const size_t state_size = llama_state_seq_get_size(ctx, slot->id);
+                    const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
 
                     auto res = std::make_unique<server_task_result_seq_state_get>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->state_data.resize(state_size);
 
-                    const size_t n_written = llama_state_seq_get_data(ctx, res->state_data.data(), state_size, slot->id);
+                    const size_t n_written = llama_state_seq_get_data(ctx_tgt, res->state_data.data(), state_size, slot->id);
                     res->state_data.resize(n_written);
                     res->n_bytes = n_written;
 
@@ -2236,14 +2236,14 @@ private:
                         break;
                     }
                     if (slot->is_processing()) {
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %" PRIu64 "\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
                     const int64_t t_start = ggml_time_us();
 
-                    const size_t n_read = llama_state_seq_set_data(ctx, task.seq_state_action.state_ptr, task.seq_state_action.state_len, slot->id);
+                    const size_t n_read = llama_state_seq_set_data(ctx_tgt, task.seq_state_action.state_ptr, task.seq_state_action.state_len, slot->id);
                     const bool success = (n_read > 0);
 
                     if (success) {
@@ -2279,7 +2279,7 @@ private:
                         break;
                     }
                     if (slot->is_processing()) {
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %" PRIu64 "\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -2301,7 +2301,7 @@ private:
                         break;
                     }
                     if (slot->is_processing()) {
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %" PRIu64 "\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -2310,7 +2310,11 @@ private:
                     const int n_discard = task.context_shift_action.n_discard;
                     const int n_tokens  = slot->prompt.n_tokens();
 
-                    if (n_keep < 0 || n_discard <= 0 || n_keep + n_discard > n_tokens) {
+                    // Compute n_keep + n_discard in int64 to avoid signed overflow
+                    // (audit finding: two near-INT_MAX values silently wrap and
+                    // sneak past the comparison).
+                    const int64_t sum = (int64_t)n_keep + (int64_t)n_discard;
+                    if (n_keep < 0 || n_discard <= 0 || sum > (int64_t)n_tokens) {
                         send_error(task, "Invalid context shift parameters: n_keep=" + std::to_string(n_keep) +
                                    " n_discard=" + std::to_string(n_discard) + " n_tokens=" + std::to_string(n_tokens),
                                    ERROR_TYPE_INVALID_REQUEST);
@@ -2320,8 +2324,8 @@ private:
                     SRV_INF("slot %d: manual context shift, n_keep = %d, n_discard = %d, n_tokens = %d\n",
                             id_slot, n_keep, n_discard, n_tokens);
 
-                    llama_memory_seq_rm (llama_get_memory(ctx), slot->id, n_keep,             n_keep + n_discard);
-                    llama_memory_seq_add(llama_get_memory(ctx), slot->id, n_keep + n_discard, n_tokens, -n_discard);
+                    llama_memory_seq_rm (llama_get_memory(ctx_tgt), slot->id, n_keep,             n_keep + n_discard);
+                    llama_memory_seq_add(llama_get_memory(ctx_tgt), slot->id, n_keep + n_discard, n_tokens, -n_discard);
 
                     {
                         GGML_ASSERT(!slot->prompt.tokens.has_mtmd);
@@ -3547,7 +3551,14 @@ void server_context::start_loop() {
 }
 
 void server_context::terminate() {
+    // Terminate BOTH queues. queue_tasks.terminate() unblocks the inference loop;
+    // queue_results.terminate() unblocks any handler thread currently waiting in
+    // server_response::recv()/recv_with_timeout() so it can unwind to its caller
+    // (HTTP or ZMQ transport) instead of blocking forever. Without the second
+    // call, a clean shutdown with in-flight requests deadlocks transport-side
+    // threads against a queue that will never deliver a result.
     impl->queue_tasks.terminate();
+    impl->queue_results.terminate();
 }
 
 llama_context * server_context::get_llama_context() const {
@@ -3865,6 +3876,77 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
     init_routes();
+}
+
+std::vector<server_route> server_routes::routes() const {
+    // Canonical route table. Order matters when transports do their own path
+    // template matching (more-specific paths should come before less-specific
+    // ones, though there are no collisions in this list). cpp-httplib uses
+    // regex matching internally and is order-insensitive.
+    //
+    // Captures handlers by reference into the returned route entries: the
+    // wrapped std::function copies are cheap, and server_routes outlives the
+    // table consumers (transports live in main()'s stack frame).
+    return {
+        // Public (no API-key check applied by middleware)
+        {"GET",  "/health",                 get_health},
+        {"GET",  "/v1/health",              get_health},
+        {"GET",  "/models",                 get_models},
+        {"GET",  "/v1/models",              get_models},
+        {"GET",  "/api/tags",               get_models},
+
+        // Metrics / props / show
+        {"GET",  "/metrics",                get_metrics},
+        {"GET",  "/props",                  get_props},
+        {"POST", "/props",                  post_props},
+
+        // Completions
+        {"POST", "/completion",             post_completions}, // legacy
+        {"POST", "/completions",            post_completions},
+        {"POST", "/v1/completions",         post_completions_oai},
+        {"POST", "/chat/completions",       post_chat_completions},
+        {"POST", "/v1/chat/completions",    post_chat_completions},
+        {"POST", "/api/chat",               post_chat_completions}, // ollama
+        {"POST", "/v1/responses",           post_responses_oai},
+        {"POST", "/responses",              post_responses_oai},
+        {"POST", "/v1/audio/transcriptions", post_transcriptions_oai},
+        {"POST", "/audio/transcriptions",    post_transcriptions_oai},
+        {"POST", "/v1/messages",            post_anthropic_messages},
+        {"POST", "/v1/messages/count_tokens", post_anthropic_count_tokens},
+
+        {"POST", "/infill",                 post_infill},
+
+        // Embeddings / rerank / classify
+        {"POST", "/embedding",              post_embeddings}, // legacy
+        {"POST", "/embeddings",             post_embeddings},
+        {"POST", "/v1/embeddings",          post_embeddings_oai},
+        {"POST", "/rerank",                 post_rerank},
+        {"POST", "/reranking",              post_rerank},
+        {"POST", "/v1/rerank",              post_rerank},
+        {"POST", "/v1/reranking",           post_rerank},
+        {"POST", "/classify",               post_classify},
+        {"POST", "/v1/classify",            post_classify},
+
+        // Token utilities
+        {"POST", "/tokenize",               post_tokenize},
+        {"POST", "/detokenize",             post_detokenize},
+        {"POST", "/apply-template",         post_apply_template},
+
+        // LoRA adapters
+        {"GET",  "/lora-adapters",          get_lora_adapters},
+        {"POST", "/lora-adapters",          post_lora_adapters},
+
+        // Slots
+        {"GET",  "/slots",                  get_slots},
+        {"POST", "/slots/:id_slot",         post_slots},
+        {"GET",  "/v1/slots/:id_slot/info", get_slot_info},
+
+        // Sessions
+        {"POST", "/sessions/:id_session",        post_sessions},
+        {"POST", "/sessions/:id_session/pin",    post_session_pin},
+        {"POST", "/sessions/:id_session/unpin",  post_session_unpin},
+        {"GET",  "/sessions",                    get_sessions},
+    };
 }
 
 void server_routes::init_routes() {
@@ -4228,59 +4310,70 @@ void server_routes::init_routes() {
     this->post_completions = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy
-        const json body = json::parse(req.body);
-        return handle_completions_impl(
+        json body = json::parse(req.body);
+        auto sa = extract_session_action(body);
+        return handle_completions_with_session(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body,
             files,
-            TASK_RESPONSE_TYPE_NONE);
+            TASK_RESPONSE_TYPE_NONE,
+            sa);
     };
 
     this->post_completions_oai = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy
-        const json body = json::parse(req.body);
-        return handle_completions_impl(
+        json body = json::parse(req.body);
+        auto sa = extract_session_action(body);
+        return handle_completions_with_session(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body,
             files,
-            TASK_RESPONSE_TYPE_OAI_CMPL);
+            TASK_RESPONSE_TYPE_OAI_CMPL,
+            sa);
     };
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+        // Extract session block BEFORE chat-params parsing so it doesn't ride
+        // along into the parsed body where it would be ignored or rejected.
+        auto sa = extract_session_action(body);
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
             files);
-        return handle_completions_impl(
+        return handle_completions_with_session(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_OAI_CHAT);
+            TASK_RESPONSE_TYPE_OAI_CHAT,
+            sa);
     };
 
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
+        json raw  = json::parse(req.body);
+        auto sa   = extract_session_action(raw);
+        json body = server_chat_convert_responses_to_chatcmpl(raw);
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
             files);
-        return handle_completions_impl(
+        return handle_completions_with_session(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_OAI_RESP);
+            TASK_RESPONSE_TYPE_OAI_RESP,
+            sa);
     };
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
@@ -4314,19 +4407,22 @@ void server_routes::init_routes() {
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        json raw  = json::parse(req.body);
+        auto sa   = extract_session_action(raw);
+        json body = server_chat_convert_anthropic_to_oai(raw);
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
             files);
-        return handle_completions_impl(
+        return handle_completions_with_session(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_ANTHROPIC);
+            TASK_RESPONSE_TYPE_ANTHROPIC,
+            sa);
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
@@ -4551,7 +4647,7 @@ void server_routes::init_routes() {
             return res;
         }
 
-        const uint32_t n_cls = llama_model_n_cls_out(ctx_server.model);
+        const uint32_t n_cls = llama_model_n_cls_out(ctx_server.model_tgt);
         if (n_cls <= 1) {
             res->error(format_error_response("Model does not have classification outputs. Use a BertForSequenceClassification model.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -4756,13 +4852,19 @@ void server_routes::init_routes() {
             return res;
         }
 
-        std::string id_session_str = req.get_param("id_session");
-        int id_session;
-        try {
-            id_session = std::stoi(id_session_str);
-        } catch (const std::exception &) {
-            res->error(format_error_response("Invalid session ID", ERROR_TYPE_INVALID_REQUEST));
+        const std::string id_session = req.get_param("id_session");
+        // Validate: nonempty, <= 128 bytes (covers PHP/Caelus user_id format),
+        // no path-separator or control characters (defense against route-table
+        // confusion and accidental log injection).
+        if (id_session.empty() || id_session.size() > 128) {
+            res->error(format_error_response("Invalid session ID (empty or > 128 bytes)", ERROR_TYPE_INVALID_REQUEST));
             return res;
+        }
+        for (unsigned char c : id_session) {
+            if (c == '/' || c == '\0' || c < 0x20 || c == 0x7F) {
+                res->error(format_error_response("Invalid session ID (contains path separator or control char)", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
         }
 
         return handle_sessions_action(req, id_session);
@@ -4778,6 +4880,43 @@ void server_routes::init_routes() {
 
         return handle_sessions_list(req);
     };
+
+    // S2b: pin and unpin endpoints. A pinned session is skipped by the LRU
+    // sweep in S2's evict_sessions_until_under_budget — used by the PHP
+    // frontend to keep a sticky-routed user's KV state in warm RAM even when
+    // newer sessions exceed the budget.
+    auto pin_handler = [this](const server_http_req & req, bool pin) -> server_http_res_ptr {
+        auto res = create_response();
+        if (!params.endpoint_slots) {
+            res->error(format_error_response("This server does not support sessions. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const std::string key = req.get_param("id_session");
+        if (key.empty()) {
+            res->error(format_error_response("Invalid session ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            auto it = sessions.find(key);
+            if (it != sessions.end()) {
+                it->second.pinned = pin;
+                found = true;
+            }
+        }
+        if (!found) {
+            res->error(format_error_response("Session not found", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res->ok(json{
+            {"id_session", key},
+            {"pinned",     pin},
+        });
+        return res;
+    };
+    this->post_session_pin   = [pin_handler](const server_http_req & req) { return pin_handler(req, true);  };
+    this->post_session_unpin = [pin_handler](const server_http_req & req) { return pin_handler(req, false); };
 }
 
 json server_routes::get_model_info() const {
@@ -4924,22 +5063,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save_state(con
     auto * res_state = dynamic_cast<server_task_result_seq_state_get*>(result.get());
     GGML_ASSERT(res_state != nullptr);
 
-    // Encode into SES1 binary format: [magic:u32][n_tokens:u32][tokens:n*llama_token][kv_data:rest]
-    const uint32_t n_tokens = (uint32_t)res_state->prompt_tokens.size();
-    const size_t header_size = sizeof(SES1_MAGIC) + sizeof(n_tokens) + n_tokens * sizeof(llama_token);
-    const size_t total_size = header_size + res_state->state_data.size();
-
-    std::vector<uint8_t> blob(total_size);
-    uint8_t * ptr = blob.data();
-    memcpy(ptr, &SES1_MAGIC, sizeof(SES1_MAGIC));
-    ptr += sizeof(SES1_MAGIC);
-    memcpy(ptr, &n_tokens, sizeof(n_tokens));
-    ptr += sizeof(n_tokens);
-    if (n_tokens > 0) {
-        memcpy(ptr, res_state->prompt_tokens.data(), n_tokens * sizeof(llama_token));
-        ptr += n_tokens * sizeof(llama_token);
+    std::vector<uint8_t> blob;
+    try {
+        blob = ses1_encode(res_state->prompt_tokens, res_state->state_data);
+    } catch (const std::length_error & e) {
+        res->error(format_error_response(e.what(), ERROR_TYPE_SERVER));
+        return res;
     }
-    memcpy(ptr, res_state->state_data.data(), res_state->state_data.size());
+    const uint32_t n_tokens   = (uint32_t)res_state->prompt_tokens.size();
+    const size_t   total_size = blob.size();
 
     // Check Accept header for response format
     auto accept_it = req.headers.find("accept");
@@ -4952,28 +5084,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save_state(con
         res->status = 200;
     } else {
         // JSON response with base64-encoded state
-        std::string base64_state;
-        base64_state.resize(((total_size + 2) / 3) * 4);
-        // Simple base64 encoding
-        static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        size_t out_idx = 0;
-        for (size_t i = 0; i < total_size; i += 3) {
-            uint32_t val = (uint32_t)blob[i] << 16;
-            if (i + 1 < total_size) val |= (uint32_t)blob[i + 1] << 8;
-            if (i + 2 < total_size) val |= (uint32_t)blob[i + 2];
-            base64_state[out_idx++] = b64_table[(val >> 18) & 0x3F];
-            base64_state[out_idx++] = b64_table[(val >> 12) & 0x3F];
-            base64_state[out_idx++] = (i + 1 < total_size) ? b64_table[(val >> 6) & 0x3F] : '=';
-            base64_state[out_idx++] = (i + 2 < total_size) ? b64_table[val & 0x3F] : '=';
-        }
-        base64_state.resize(out_idx);
-
         res->ok(json{
             {"id_slot",  id_slot},
             {"n_tokens", (int)n_tokens},
             {"n_bytes",  (int)total_size},
             {"t_ms",     res_state->t_ms},
-            {"state",    base64_state},
+            {"state",    base64_encode(blob.data(), blob.size())},
         });
     }
 
@@ -5000,72 +5116,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore_state(
             return res;
         }
         const std::string & b64 = body.at("state").get_ref<const std::string &>();
-
-        // Simple base64 decoding
-        static const int b64_decode[256] = {
-            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-            -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-            -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        };
-        blob.reserve((b64.size() / 4) * 3);
-        for (size_t i = 0; i < b64.size(); i += 4) {
-            int a = b64_decode[(unsigned char)b64[i]];
-            int b = (i + 1 < b64.size()) ? b64_decode[(unsigned char)b64[i + 1]] : -1;
-            int c = (i + 2 < b64.size()) ? b64_decode[(unsigned char)b64[i + 2]] : -1;
-            int d = (i + 3 < b64.size()) ? b64_decode[(unsigned char)b64[i + 3]] : -1;
-            if (a < 0 || b < 0) break;
-            blob.push_back((uint8_t)((a << 2) | (b >> 4)));
-            if (c >= 0) blob.push_back((uint8_t)(((b & 0xF) << 4) | (c >> 2)));
-            if (d >= 0) blob.push_back((uint8_t)(((c & 0x3) << 6) | d));
+        if (!base64_decode(b64, blob)) {
+            res->error(format_error_response("\"state\" is not valid base64", ERROR_TYPE_INVALID_REQUEST));
+            return res;
         }
     }
 
-    // Parse SES1 format: [magic:u32][n_tokens:u32][tokens:n*llama_token][kv_data:rest]
-    const size_t min_header = sizeof(SES1_MAGIC) + sizeof(uint32_t);
-    if (blob.size() < min_header) {
-        res->error(format_error_response("State data too small", ERROR_TYPE_INVALID_REQUEST));
+    ses1_decoded dec;
+    std::string  err;
+    if (!ses1_decode(blob, dec, err)) {
+        res->error(format_error_response("Invalid SES1 blob: " + err, ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
-
-    const uint8_t * ptr = blob.data();
-    uint32_t magic;
-    memcpy(&magic, ptr, sizeof(magic));
-    ptr += sizeof(magic);
-    if (magic != SES1_MAGIC) {
-        res->error(format_error_response("Invalid state format (expected SES1 magic)", ERROR_TYPE_INVALID_REQUEST));
-        return res;
-    }
-
-    uint32_t n_tokens;
-    memcpy(&n_tokens, ptr, sizeof(n_tokens));
-    ptr += sizeof(n_tokens);
-
-    const size_t tokens_size = n_tokens * sizeof(llama_token);
-    if (blob.size() < min_header + tokens_size) {
-        res->error(format_error_response("State data truncated (tokens section)", ERROR_TYPE_INVALID_REQUEST));
-        return res;
-    }
-
-    const llama_token * prompt_tokens_ptr = reinterpret_cast<const llama_token *>(ptr);
-    ptr += tokens_size;
-
-    const uint8_t * kv_data = ptr;
-    const size_t kv_len = blob.size() - (ptr - blob.data());
 
     auto & rd = res->rd;
     {
         server_task task(SERVER_TASK_TYPE_SEQ_STATE_SET);
         task.id = rd.get_new_id();
-        task.seq_state_action.slot_id = id_slot;
-        task.seq_state_action.state_ptr = kv_data;
-        task.seq_state_action.state_len = kv_len;
-        task.seq_state_action.prompt_tokens_ptr = prompt_tokens_ptr;
-        task.seq_state_action.prompt_tokens_count = n_tokens;
+        task.seq_state_action.slot_id            = id_slot;
+        task.seq_state_action.state_ptr          = dec.kv_data;
+        task.seq_state_action.state_len          = dec.kv_len;
+        task.seq_state_action.prompt_tokens_ptr  = dec.tokens;
+        task.seq_state_action.prompt_tokens_count = (uint32_t)dec.n_tokens;
         rd.post_task(std::move(task));
     }
 
@@ -5129,8 +5201,21 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_context_shift(
     const int n_keep    = json_value(body, "n_keep",    0);
     const int n_discard = json_value(body, "n_discard", 0);
 
+    if (n_keep < 0) {
+        res->error(format_error_response("\"n_keep\" non-negative integer (security)", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
     if (n_discard <= 0) {
-        res->error(format_error_response("\"n_discard\" must be a positive integer", ERROR_TYPE_INVALID_REQUEST));
+        res->error(format_error_response("\"n_discard\" must be a positive integer (security)", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    // Reject sums that overflow signed-int in the task handler. Even a single
+    // very large n_keep can't make sense as a context shift; cap each at
+    // INT_MAX/2 so n_keep + n_discard always fits in a signed int.
+    if (n_keep > INT_MAX / 2 || n_discard > INT_MAX / 2) {
+        res->error(format_error_response("\"n_keep\"/\"n_discard\" exceed reasonable bounds", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
 
@@ -5261,7 +5346,223 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
 // Server-side session storage handlers
 // ================================================================================================
 
-std::unique_ptr<server_res_generator> server_routes::handle_sessions_action(const server_http_req & req, int id_session) {
+server_routes::session_action server_routes::extract_session_action(json & body) {
+    session_action sa;
+    if (!body.contains("session") || !body["session"].is_object()) {
+        return sa;
+    }
+    sa.present = true;
+    const auto & s = body["session"];
+    sa.restore_key    = json_value<std::string>(s, "restore_key", "");
+    sa.save_key_after = json_value<std::string>(s, "save_key_after", "");
+    sa.evict_after    = json_value<bool>(s, "evict_after", false);
+    body.erase("session");
+    return sa;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_completions_with_session(
+        const server_http_req & req,
+        server_task_type type,
+        const json & data,
+        const std::vector<raw_buffer> & files,
+        task_response_type res_type,
+        const session_action & sa) {
+    // Both restore_key and save_key_after require id_slot at the top level.
+    if (sa.present && (!sa.restore_key.empty() || !sa.save_key_after.empty())) {
+        const int id_slot = json_value(data, "id_slot", -1);
+        if (id_slot < 0) {
+            auto res = create_response();
+            res->error(format_error_response(
+                "session.restore_key / session.save_key_after require body.id_slot >= 0",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!sa.restore_key.empty()) {
+            std::string err;
+            if (!perform_session_restore(sa.restore_key, id_slot, req.should_stop, err)) {
+                auto res = create_response();
+                res->error(format_error_response("session restore failed: " + err, ERROR_TYPE_SERVER));
+                return res;
+            }
+        }
+    }
+
+    auto res = handle_completions_impl(req, type, data, files, res_type);
+
+    if (sa.present && !sa.save_key_after.empty()) {
+        const int id_slot = json_value(data, "id_slot", -1);
+        const std::string key  = sa.save_key_after;
+        const bool        evict = sa.evict_after;
+        if (!res->is_stream()) {
+            std::string err;
+            if (!perform_session_save(key, id_slot, evict, req.should_stop, err)) {
+                LOG_WRN("session save failed for key=%s: %s\n", key.c_str(), err.c_str());
+            }
+        } else {
+            // Stream case: install on_end. req goes out of scope before this
+            // fires (after the final wire byte), so capture by value and use
+            // a no-op should_stop — once streaming has completed we always
+            // want the save to run.
+            res->on_end = [this, key, id_slot, evict]() {
+                std::string err;
+                auto never_stop = []{ return false; };
+                if (!perform_session_save(key, id_slot, evict, never_stop, err)) {
+                    LOG_WRN("session save failed (stream) for key=%s: %s\n", key.c_str(), err.c_str());
+                }
+            };
+        }
+    }
+
+    return res;
+}
+
+bool server_routes::perform_session_restore(const std::string & key, int id_slot,
+                                            const std::function<bool()> & should_stop,
+                                            std::string & err_out) {
+    // Find the blob under the sessions lock (refcount bump only).
+    std::shared_ptr<const std::vector<uint8_t>> blob_ref;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex);
+        auto it = sessions.find(key);
+        if (it == sessions.end()) {
+            err_out = "session not found";
+            return false;
+        }
+        blob_ref = it->second.data;
+    }
+    if (!blob_ref) {
+        err_out = "session has no data";
+        return false;
+    }
+
+    // Decode SES1 (pointers into the shared blob; valid as long as blob_ref lives).
+    ses1_decoded dec;
+    if (!ses1_decode(*blob_ref, dec, err_out)) {
+        return false;
+    }
+
+    // One-off response_reader for the SEQ_STATE_SET task. Destructor cleans
+    // up the reader's task_id from queue_results.waiting_task_ids.
+    server_response_reader rd(queue_tasks, queue_results, 1);
+    server_task task(SERVER_TASK_TYPE_SEQ_STATE_SET);
+    task.id = rd.get_new_id();
+    task.seq_state_action.slot_id             = id_slot;
+    task.seq_state_action.state_ptr           = dec.kv_data;
+    task.seq_state_action.state_len           = dec.kv_len;
+    task.seq_state_action.prompt_tokens_ptr   = dec.tokens;
+    task.seq_state_action.prompt_tokens_count = (uint32_t)dec.n_tokens;
+    rd.post_task(std::move(task));
+
+    auto result = rd.next(should_stop);
+    if (!result) {
+        err_out = "session restore cancelled or queue shut down";
+        return false;
+    }
+    if (result->is_error()) {
+        err_out = "session restore task failed";
+        return false;
+    }
+    return true;
+}
+
+bool server_routes::perform_session_save(const std::string & key, int id_slot,
+                                         bool evict_after,
+                                         const std::function<bool()> & should_stop,
+                                         std::string & err_out) {
+    server_response_reader rd(queue_tasks, queue_results, 1);
+    server_task task(SERVER_TASK_TYPE_SEQ_STATE_GET);
+    task.id = rd.get_new_id();
+    task.seq_state_action.slot_id = id_slot;
+    rd.post_task(std::move(task));
+
+    auto result = rd.next(should_stop);
+    if (!result) {
+        err_out = "session save cancelled or queue shut down";
+        return false;
+    }
+    if (result->is_error()) {
+        err_out = "session save task failed";
+        return false;
+    }
+    auto * res_state = dynamic_cast<server_task_result_seq_state_get*>(result.get());
+    if (!res_state) {
+        err_out = "session save: unexpected task result variant";
+        return false;
+    }
+
+    std::vector<uint8_t> blob;
+    try {
+        blob = ses1_encode(res_state->prompt_tokens, res_state->state_data);
+    } catch (const std::length_error & e) {
+        err_out = e.what();
+        return false;
+    }
+    const size_t blob_size = blob.size();
+    auto blob_ref = std::make_shared<const std::vector<uint8_t>>(std::move(blob));
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::lock_guard<std::mutex> lock(sessions_mutex);
+    if (evict_after) {
+        // PHP/Caelus will take the canonical copy to Redis after this call
+        // returns; drop any warm entry under this key without storing.
+        auto it = sessions.find(key);
+        if (it != sessions.end()) {
+            sessions_total_bytes_.fetch_sub(it->second.size(), std::memory_order_relaxed);
+            sessions.erase(it);
+        }
+    } else {
+        auto it = sessions.find(key);
+        if (it != sessions.end()) {
+            sessions_total_bytes_.fetch_sub(it->second.size(), std::memory_order_relaxed);
+            it->second.data       = blob_ref;
+            it->second.updated_at = now;
+            sessions_total_bytes_.fetch_add(blob_size, std::memory_order_relaxed);
+        } else {
+            sessions.emplace(key, session_state(blob_ref, now));
+            sessions_total_bytes_.fetch_add(blob_size, std::memory_order_relaxed);
+        }
+        evict_sessions_until_under_budget();
+    }
+    return true;
+}
+
+size_t server_routes::evict_sessions_until_under_budget() {
+    // Caller must hold sessions_mutex.
+    if (params.sessions_max_bytes <= 0) return 0; // unbounded
+    size_t evicted = 0;
+    while (sessions_total_bytes_.load(std::memory_order_relaxed) > (size_t)params.sessions_max_bytes) {
+        // pick the least-recently-updated unpinned entry
+        auto victim = sessions.end();
+        int64_t oldest = INT64_MAX;
+        for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+            if (it->second.pinned) continue;
+            if (it->second.updated_at < oldest) {
+                oldest = it->second.updated_at;
+                victim = it;
+            }
+        }
+        if (victim == sessions.end()) {
+            // budget exceeded but no candidates: log once per call so an
+            // operator running over-budget with everything pinned sees a
+            // signal in the log, without spamming on every insert.
+            SRV_WRN("sessions over budget; all entries pinned (total=%zu, budget=%lld)\n",
+                    sessions_total_bytes_.load(std::memory_order_relaxed),
+                    (long long)params.sessions_max_bytes);
+            break;
+        }
+        const size_t victim_size = victim->second.size();
+        const int64_t age_ms = ggml_time_ms() - victim->second.updated_at * 1000;
+        SRV_INF("evicted session %s (size=%zu, age_ms=%lld)\n",
+                victim->first.c_str(), victim_size, (long long)age_ms);
+        sessions_total_bytes_.fetch_sub(victim_size, std::memory_order_relaxed);
+        sessions.erase(victim);
+        ++evicted;
+    }
+    return evicted;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_sessions_action(const server_http_req & req, const std::string & id_session) {
     auto res = create_response();
 
     std::string action = req.get_param("action");
@@ -5299,35 +5600,40 @@ std::unique_ptr<server_res_generator> server_routes::handle_sessions_action(cons
         auto * res_state = dynamic_cast<server_task_result_seq_state_get*>(result.get());
         GGML_ASSERT(res_state != nullptr);
 
-        // Encode into SES1 binary format
-        const uint32_t n_tokens = (uint32_t)res_state->prompt_tokens.size();
-        const size_t header_size = sizeof(SES1_MAGIC) + sizeof(n_tokens) + n_tokens * sizeof(llama_token);
-        const size_t total_size = header_size + res_state->state_data.size();
-
-        std::vector<uint8_t> blob(total_size);
-        uint8_t * ptr = blob.data();
-        memcpy(ptr, &SES1_MAGIC, sizeof(SES1_MAGIC));
-        ptr += sizeof(SES1_MAGIC);
-        memcpy(ptr, &n_tokens, sizeof(n_tokens));
-        ptr += sizeof(n_tokens);
-        if (n_tokens > 0) {
-            memcpy(ptr, res_state->prompt_tokens.data(), n_tokens * sizeof(llama_token));
-            ptr += n_tokens * sizeof(llama_token);
+        std::vector<uint8_t> blob;
+        try {
+            blob = ses1_encode(res_state->prompt_tokens, res_state->state_data);
+        } catch (const std::length_error & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_SERVER));
+            return res;
         }
-        memcpy(ptr, res_state->state_data.data(), res_state->state_data.size());
+        const uint32_t n_tokens   = (uint32_t)res_state->prompt_tokens.size();
+        const size_t   total_size = blob.size();
 
-        // Store in session map
+        // Store in session map. The blob is wrapped in shared_ptr<const ...> so
+        // a concurrent restore can take an O(1) refcount bump under the lock
+        // and dereference outside it. Accounting is updated alongside the map
+        // mutation so sessions_total_bytes_ stays consistent.
+        const size_t blob_size = blob.size();
+        auto blob_ref = std::make_shared<const std::vector<uint8_t>>(std::move(blob));
         int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         {
             std::lock_guard<std::mutex> lock(sessions_mutex);
             auto it = sessions.find(id_session);
             if (it != sessions.end()) {
-                it->second.data = std::move(blob);
+                const size_t old_size = it->second.size();
+                it->second.data = blob_ref;
                 it->second.updated_at = now;
+                sessions_total_bytes_.fetch_add(blob_size, std::memory_order_relaxed);
+                sessions_total_bytes_.fetch_sub(old_size, std::memory_order_relaxed);
             } else {
-                sessions.emplace(id_session, session_state(std::move(blob), now));
+                sessions.emplace(id_session, session_state(blob_ref, now));
+                sessions_total_bytes_.fetch_add(blob_size, std::memory_order_relaxed);
             }
+            // S2: enforce the RAM budget after every insert/replace. No-op if
+            // params.sessions_max_bytes == 0 (unbounded).
+            evict_sessions_until_under_budget();
         }
 
         res->ok(json{
@@ -5390,57 +5696,45 @@ std::unique_ptr<server_res_generator> server_routes::handle_sessions_action(cons
                 return res;
             }
         } else {
-            // Map-based restore
-            std::lock_guard<std::mutex> lock(sessions_mutex);
-            auto it = sessions.find(id_session);
-            if (it == sessions.end()) {
-                res->error(format_error_response("Session not found", ERROR_TYPE_INVALID_REQUEST));
+            // Map-based restore. Take an O(1) refcount bump on the shared blob
+            // under the lock, then read outside the lock. This was the
+            // contention point that previously serialized all session restores
+            // through a 100 MB vector copy.
+            std::shared_ptr<const std::vector<uint8_t>> blob_ref;
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex);
+                auto it = sessions.find(id_session);
+                if (it == sessions.end()) {
+                    res->error(format_error_response("Session not found", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                blob_ref = it->second.data;
+            }
+            if (!blob_ref) {
+                res->error(format_error_response("Session has no data", ERROR_TYPE_SERVER));
                 return res;
             }
-            blob = it->second.data;  // copy - we can't hold lock during restore
+            blob = *blob_ref;  // intentional copy: ses1_decode needs an addressable vector.
+                               // For very large sessions this can be elided in a future pass
+                               // by widening ses1_decode to accept a span/ptr+len.
         }
 
-        // Parse SES1 format
-        const size_t min_header = sizeof(SES1_MAGIC) + sizeof(uint32_t);
-        if (blob.size() < min_header) {
-            res->error(format_error_response("Session data corrupted (too small)", ERROR_TYPE_SERVER));
+        ses1_decoded dec;
+        std::string  err;
+        if (!ses1_decode(blob, dec, err)) {
+            res->error(format_error_response("Session data corrupted: " + err, ERROR_TYPE_SERVER));
             return res;
         }
-
-        const uint8_t * ptr = blob.data();
-        uint32_t magic;
-        memcpy(&magic, ptr, sizeof(magic));
-        ptr += sizeof(magic);
-        if (magic != SES1_MAGIC) {
-            res->error(format_error_response("Session data corrupted (invalid magic)", ERROR_TYPE_SERVER));
-            return res;
-        }
-
-        uint32_t n_tokens;
-        memcpy(&n_tokens, ptr, sizeof(n_tokens));
-        ptr += sizeof(n_tokens);
-
-        const size_t tokens_size = n_tokens * sizeof(llama_token);
-        if (blob.size() < min_header + tokens_size) {
-            res->error(format_error_response("Session data corrupted (truncated)", ERROR_TYPE_SERVER));
-            return res;
-        }
-
-        const llama_token * prompt_tokens_ptr = reinterpret_cast<const llama_token *>(ptr);
-        ptr += tokens_size;
-
-        const uint8_t * kv_data = ptr;
-        const size_t kv_len = blob.size() - (ptr - blob.data());
 
         auto & rd = res->rd;
         {
             server_task task(SERVER_TASK_TYPE_SEQ_STATE_SET);
             task.id = rd.get_new_id();
-            task.seq_state_action.slot_id = id_slot;
-            task.seq_state_action.state_ptr = kv_data;
-            task.seq_state_action.state_len = kv_len;
-            task.seq_state_action.prompt_tokens_ptr = prompt_tokens_ptr;
-            task.seq_state_action.prompt_tokens_count = n_tokens;
+            task.seq_state_action.slot_id            = id_slot;
+            task.seq_state_action.state_ptr          = dec.kv_data;
+            task.seq_state_action.state_len          = dec.kv_len;
+            task.seq_state_action.prompt_tokens_ptr  = dec.tokens;
+            task.seq_state_action.prompt_tokens_count = (uint32_t)dec.n_tokens;
             rd.post_task(std::move(task));
         }
 
@@ -5475,6 +5769,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_sessions_action(cons
             std::lock_guard<std::mutex> lock(sessions_mutex);
             auto it = sessions.find(id_session);
             if (it != sessions.end()) {
+                sessions_total_bytes_.fetch_sub(it->second.size(), std::memory_order_relaxed);
                 removed = std::move(it->second);
                 sessions.erase(it);
                 found = true;
@@ -5517,7 +5812,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_sessions_action(cons
                 res->error(format_error_response("Failed to create file: " + filename, ERROR_TYPE_SERVER));
                 return res;
             }
-            if (!ofs.write(reinterpret_cast<const char*>(removed.data.data()), removed.data.size())) {
+            const auto * blob_ptr = removed.data.get();
+            if (!blob_ptr) {
+                res->error(format_error_response("Session has no data", ERROR_TYPE_SERVER));
+                return res;
+            }
+            if (!ofs.write(reinterpret_cast<const char*>(blob_ptr->data()), blob_ptr->size())) {
                 res->error(format_error_response("Failed to write file: " + filename, ERROR_TYPE_SERVER));
                 return res;
             }
@@ -5526,7 +5826,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_sessions_action(cons
                 {"id_session", id_session},
                 {"removed",    true},
                 {"file",       filename},
-                {"n_bytes",    (int64_t)removed.data.size()},
+                {"n_bytes",    (int64_t)blob_ptr->size()},
             });
         } else {
             res->ok(json{
@@ -5554,6 +5854,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_sessions_list(const 
                 {"size",       (int64_t)state.size()},
                 {"created_at", state.created_at},
                 {"updated_at", state.updated_at},
+                {"pinned",     state.pinned},
             });
         }
     }

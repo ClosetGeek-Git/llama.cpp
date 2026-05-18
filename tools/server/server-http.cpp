@@ -445,6 +445,16 @@ static void process_handler_response(server_http_req_ptr && request, server_http
             return has_next;
         };
         const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
+            // Fire the transport-agnostic on_end hook BEFORE releasing the
+            // response object — handlers (e.g. Phase 3 S3 one-shot session
+            // save) install on_end to run after the final byte is sent.
+            if (response && response->on_end) {
+                try {
+                    response->on_end();
+                } catch (const std::exception & e) {
+                    SRV_WRN("http: on_end threw: %s\n", e.what());
+                }
+            }
             response.reset(); // trigger the destruction of the response object
             request.reset();  // trigger the destruction of the request object
         };
@@ -453,6 +463,18 @@ static void process_handler_response(server_http_req_ptr && request, server_http
         res.status = response->status;
         set_headers(res, response->headers);
         res.set_content(response->data, response->content_type);
+        // Non-streaming response: fire on_end synchronously after writing the
+        // body to the response object (it'll go on the wire when cpp-httplib
+        // serializes the Response). Handler code that depends on the response
+        // having been DELIVERED (rather than just queued for delivery) should
+        // be aware: cpp-httplib does the actual send after this lambda returns.
+        if (response->on_end) {
+            try {
+                response->on_end();
+            } catch (const std::exception & e) {
+                SRV_WRN("http: on_end threw: %s\n", e.what());
+            }
+        }
     }
 }
 

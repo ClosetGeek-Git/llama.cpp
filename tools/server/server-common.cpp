@@ -9,9 +9,13 @@
 
 #include "server-common.h"
 
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <limits>
 #include <random>
 #include <sstream>
-#include <fstream>
+#include <stdexcept>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1592,4 +1596,171 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+
+//
+// SES1 binary format helpers
+//
+
+static inline void ses1_write_u32_le(uint8_t * dst, uint32_t v) {
+    dst[0] = (uint8_t)(v);
+    dst[1] = (uint8_t)(v >> 8);
+    dst[2] = (uint8_t)(v >> 16);
+    dst[3] = (uint8_t)(v >> 24);
+}
+
+static inline uint32_t ses1_read_u32_le(const uint8_t * src) {
+    return  (uint32_t)src[0]
+         | ((uint32_t)src[1] << 8)
+         | ((uint32_t)src[2] << 16)
+         | ((uint32_t)src[3] << 24);
+}
+
+std::vector<uint8_t> ses1_encode(const std::vector<llama_token> & prompt_tokens,
+                                 const std::vector<uint8_t>     & state_data) {
+    const size_t n = prompt_tokens.size();
+    if (n > SES1_MAX_TOKENS) {
+        throw std::length_error("ses1_encode: prompt_tokens count exceeds SES1_MAX_TOKENS");
+    }
+
+    constexpr size_t header_fixed = sizeof(uint32_t) * 2; // magic + n_tokens
+    const     size_t tokens_bytes = n * sizeof(llama_token);
+    if (state_data.size() > std::numeric_limits<size_t>::max() - header_fixed - tokens_bytes) {
+        throw std::length_error("ses1_encode: total size overflows size_t");
+    }
+    const size_t total = header_fixed + tokens_bytes + state_data.size();
+
+    std::vector<uint8_t> blob(total);
+    // Magic and n_tokens are written as little-endian uint32s regardless of host
+    // byte order, so the on-wire/on-disk SES1 format is identical across LE and
+    // BE machines for the header.
+    ses1_write_u32_le(blob.data() + 0, SES1_MAGIC);
+    ses1_write_u32_le(blob.data() + 4, (uint32_t)n);
+    if (n > 0) {
+        // NOTE: the prompt token array is written in host byte order. Within a
+        // homogeneous x86_64/ARM64 mesh this is fine; cross-architecture session
+        // migration would need a byte-swap pass here (not yet a requirement).
+        std::memcpy(blob.data() + header_fixed, prompt_tokens.data(), tokens_bytes);
+    }
+    if (!state_data.empty()) {
+        std::memcpy(blob.data() + header_fixed + tokens_bytes,
+                    state_data.data(), state_data.size());
+    }
+    return blob;
+}
+
+bool ses1_decode(const std::vector<uint8_t> & blob, ses1_decoded & out, std::string & err) {
+    constexpr size_t header_fixed = sizeof(uint32_t) * 2;
+    if (blob.size() < header_fixed) {
+        err = "blob too small for SES1 header";
+        return false;
+    }
+
+    const uint8_t * p = blob.data();
+    const uint32_t magic = ses1_read_u32_le(p);
+    if (magic != SES1_MAGIC) {
+        err = "invalid SES1 magic";
+        return false;
+    }
+
+    const uint32_t n_tokens = ses1_read_u32_le(p + 4);
+    if (n_tokens > SES1_MAX_TOKENS) {
+        err = "n_tokens exceeds SES1_MAX_TOKENS";
+        return false;
+    }
+    // overflow-safe check before multiplying
+    if ((size_t)n_tokens > std::numeric_limits<size_t>::max() / sizeof(llama_token)) {
+        err = "n_tokens * sizeof(llama_token) overflows size_t";
+        return false;
+    }
+    const size_t tokens_bytes = (size_t)n_tokens * sizeof(llama_token);
+    if (blob.size() < header_fixed + tokens_bytes) {
+        err = "blob truncated (tokens section)";
+        return false;
+    }
+
+    out.tokens   = (n_tokens > 0) ? reinterpret_cast<const llama_token *>(p + header_fixed) : nullptr;
+    out.n_tokens = (size_t)n_tokens;
+    out.kv_data  = p + header_fixed + tokens_bytes;
+    out.kv_len   = blob.size() - (header_fixed + tokens_bytes);
+    return true;
+}
+
+//
+// Base64 — thin wrapper over common/base64.hpp (public domain) with a strict
+// length check on decode. Replaces the four hand-rolled copies that previously
+// lived inline in server-context.cpp's slot save/restore handlers.
+//
+
+std::string base64_encode(const uint8_t * data, size_t len) {
+    return base64::encode(reinterpret_cast<const char *>(data), len, base64::alphabet::standard);
+}
+
+bool base64_decode(const std::string & b64, std::vector<uint8_t> & out) {
+    out.clear();
+    if (b64.empty() || (b64.size() % 4) != 0) {
+        return false;
+    }
+    try {
+        out.reserve((b64.size() / 4) * 3);
+        base64::decode(b64.begin(), b64.end(), std::back_inserter(out), base64::alphabet::standard);
+    } catch (const base64_error &) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+//
+// Route-template matching — shared by every transport.
+//
+
+std::vector<std::string> split_path(const std::string & p) {
+    std::vector<std::string> out;
+    size_t i = 0, n = p.size();
+    while (i < n) {
+        while (i < n && p[i] == '/') ++i;
+        if (i >= n) break;
+        size_t j = i;
+        while (j < n && p[j] != '/') ++j;
+        out.emplace_back(p.substr(i, j - i));
+        i = j;
+    }
+    return out;
+}
+
+bool match_route_template(const std::string & tmpl,
+                          const std::string & path,
+                          std::map<std::string, std::string> & out_params,
+                          const std::string & prefix) {
+    std::string p = path;
+    if (!prefix.empty()) {
+        if (p.rfind(prefix, 0) == 0) {
+            p = p.substr(prefix.size());
+            if (p.empty()) p = "/";
+        } else {
+            return false;
+        }
+    }
+    const auto path_parts = split_path(p);
+    const auto tmpl_parts = split_path(tmpl);
+    if (path_parts.size() != tmpl_parts.size()) {
+        return false;
+    }
+    std::map<std::string, std::string> captured;
+    for (size_t i = 0; i < tmpl_parts.size(); ++i) {
+        const auto & t = tmpl_parts[i];
+        const auto & v = path_parts[i];
+        if (!t.empty() && t[0] == ':') {
+            captured[t.substr(1)] = v;
+        } else if (t != v) {
+            return false;
+        }
+    }
+    // Merge captures only on success so caller's map isn't partially modified
+    // by a no-match.
+    for (auto & kv : captured) {
+        out_params[kv.first] = std::move(kv.second);
+    }
+    return true;
 }

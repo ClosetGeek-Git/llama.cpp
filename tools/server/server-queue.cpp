@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <chrono>
+#include <cinttypes>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -19,15 +20,15 @@
 // server_queue
 //
 
-int server_queue::post(server_task && task, bool front) {
+uint64_t server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    GGML_ASSERT(task.id != -1);
+    GGML_ASSERT(task.id != TASK_ID_UNASSIGNED);
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
     }
-    const int task_id = task.id;
-    QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
+    const uint64_t task_id = task.id;
+    QUE_DBG("new task, id = %" PRIu64 ", front = %d\n", task_id, front);
     if (front) {
         queue_tasks.push_front(std::move(task));
     } else {
@@ -38,17 +39,17 @@ int server_queue::post(server_task && task, bool front) {
     return task_id;
 }
 
-int server_queue::post(std::vector<server_task> && tasks, bool front) {
+uint64_t server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     for (auto & task : tasks) {
-        if (task.id == -1) {
-            task.id = id++;
+        if (task.id == TASK_ID_UNASSIGNED) {
+            task.id = id.fetch_add(1, std::memory_order_relaxed);
         }
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
             cleanup_pending_task(task.id_target);
         }
-        QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
+        QUE_DBG("new task, id = %" PRIu64 "/%d, front = %d\n", task.id, (int) tasks.size(), front);
         if (front) {
             queue_tasks.push_front(std::move(task));
         } else {
@@ -62,16 +63,16 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
 
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    QUE_DBG("defer task, id = %d\n", task.id);
+    QUE_DBG("defer task, id = %" PRIu64 "\n", task.id);
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
 }
 
-int server_queue::get_new_id() {
-    std::unique_lock<std::mutex> lock(mutex_tasks);
-    int new_id = id++;
-    return new_id;
+uint64_t server_queue::get_new_id() {
+    // atomic counter; no need to hold mutex_tasks. Wraparound after 2^64 task IDs
+    // is effectively impossible (~580 years at 1 billion tasks per second).
+    return id.fetch_add(1, std::memory_order_relaxed);
 }
 
 void server_queue::pop_deferred_task(int id_slot) {
@@ -81,7 +82,7 @@ void server_queue::pop_deferred_task(int id_slot) {
         bool found = false;
         for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
             if (it->id_slot == id_slot) {
-                QUE_DBG("pop deferred task (use slot %d), id_task = %d\n", id_slot, it->id);
+                QUE_DBG("pop deferred task (use slot %d), id_task = %" PRIu64 "\n", id_slot, it->id);
                 queue_tasks.emplace_front(std::move(*it));
                 queue_tasks_deferred.erase(it);
                 found = true;
@@ -90,7 +91,7 @@ void server_queue::pop_deferred_task(int id_slot) {
         }
         // if not tasks found using the slot, just pop the first deferred task (default behavior)
         if (!found) {
-            QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
+            QUE_DBG("pop deferred task, id_task = %" PRIu64 "\n", queue_tasks_deferred.front().id);
             queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
             queue_tasks_deferred.pop_front();
         }
@@ -153,7 +154,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             queue_tasks.pop_front();
             lock.unlock();
 
-            QUE_DBG("processing task, id = %d\n", task.id);
+            QUE_DBG("processing task, id = %" PRIu64 "\n", task.id);
             callback_new_task(std::move(task));
         }
         // all tasks in the current loop is processed, slots data is now ready
@@ -208,7 +209,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     }
 }
 
-void server_queue::cleanup_pending_task(int id_target) {
+void server_queue::cleanup_pending_task(uint64_t id_target) {
     // no need lock because this is called exclusively by post()
     auto rm_func = [id_target](const server_task & task) {
         return task.id == id_target;
@@ -225,24 +226,24 @@ void server_queue::cleanup_pending_task(int id_target) {
 // server_response
 //
 
-void server_response::add_waiting_task_id(int id_task) {
-    RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
+void server_response::add_waiting_task_id(uint64_t id_task) {
+    RES_DBG("add task %" PRIu64 " to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
 
     std::unique_lock<std::mutex> lock(mutex_results);
     waiting_task_ids.insert(id_task);
 }
 
-void server_response::add_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
+void server_response::add_waiting_task_ids(const std::unordered_set<uint64_t> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
     for (const auto & id_task : id_tasks) {
-        RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
+        RES_DBG("add task %" PRIu64 " to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
         waiting_task_ids.insert(id_task);
     }
 }
 
-void server_response::remove_waiting_task_id(int id_task) {
-    RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
+void server_response::remove_waiting_task_id(uint64_t id_task) {
+    RES_DBG("remove task %" PRIu64 " from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
 
     std::unique_lock<std::mutex> lock(mutex_results);
     waiting_task_ids.erase(id_task);
@@ -254,25 +255,27 @@ void server_response::remove_waiting_task_id(int id_task) {
         queue_results.end());
 }
 
-void server_response::remove_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
+void server_response::remove_waiting_task_ids(const std::unordered_set<uint64_t> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
     for (const auto & id_task : id_tasks) {
-        RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
+        RES_DBG("remove task %" PRIu64 " from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
         waiting_task_ids.erase(id_task);
     }
 }
 
-server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
+server_task_result_ptr server_response::recv(const std::unordered_set<uint64_t> & id_tasks) {
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
+        // wake when there's a result OR when terminate() has been called; on terminate
+        // we return nullptr so callers (HTTP/ZMQ handler threads) can unwind cleanly.
         condition_results.wait(lock, [&]{
-            if (!running) {
-                RES_DBG("%s : queue result stop\n", "recv");
-                std::terminate(); // we cannot return here since the caller is HTTP code
-            }
-            return !queue_results.empty();
+            return !running || !queue_results.empty();
         });
+        if (!running) {
+            RES_DBG("%s : queue result stop (returning nullptr)\n", "recv");
+            return nullptr;
+        }
 
         for (size_t i = 0; i < queue_results.size(); i++) {
             if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
@@ -282,11 +285,9 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
             }
         }
     }
-
-    // should never reach here
 }
 
-server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<uint64_t> & id_tasks, int timeout) {
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -300,35 +301,33 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
 
         std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
         if (!running) {
-            RES_DBG("%s : queue result stop\n", __func__);
-            std::terminate(); // we cannot return here since the caller is HTTP code
+            RES_DBG("%s : queue result stop (returning nullptr)\n", __func__);
+            return nullptr;
         }
         if (cr_res == std::cv_status::timeout) {
             return nullptr;
         }
     }
-
-    // should never reach here
 }
 
-server_task_result_ptr server_response::recv(int id_task) {
-    std::unordered_set<int> id_tasks = {id_task};
+server_task_result_ptr server_response::recv(uint64_t id_task) {
+    std::unordered_set<uint64_t> id_tasks = {id_task};
     return recv(id_tasks);
 }
 
 void server_response::send(server_task_result_ptr && result) {
-    RES_DBG("sending result for task id = %d\n", result->id);
+    RES_DBG("sending result for task id = %" PRIu64 "\n", result->id);
 
     std::unique_lock<std::mutex> lock(mutex_results);
-    for (const auto & id_task : waiting_task_ids) {
-        if (result->id == id_task) {
-            RES_DBG("task id = %d pushed to result queue\n", result->id);
-
-            queue_results.emplace_back(std::move(result));
-            condition_results.notify_all();
-            return;
-        }
+    // O(1) membership test; with monotonic uint64 ids, "no waiter -> drop" is the
+    // expected behavior (reader cancelled before our send arrived).
+    if (waiting_task_ids.count(result->id)) {
+        RES_DBG("task id = %" PRIu64 " pushed to result queue\n", result->id);
+        queue_results.emplace_back(std::move(result));
+        condition_results.notify_all();
+        return;
     }
+    RES_DBG("dropping result for task id = %" PRIu64 " (no waiter)\n", result->id);
 }
 
 void server_response::terminate() {
@@ -373,12 +372,25 @@ bool server_response_reader::has_next() const {
     return !cancelled && received_count < id_tasks.size();
 }
 
-// return nullptr if should_stop() is true before receiving a result
+// return nullptr if should_stop() is true before receiving a result, or if the
+// result queue has been terminated (shutdown in progress).
 // note: if one error is received, it will stop further processing and return error result
 server_task_result_ptr server_response_reader::next(const std::function<bool()> & should_stop) {
     while (true) {
+        // fast path: if the result queue has stopped accepting sends, stop waiting.
+        // (recv_with_timeout also detects this, but checking here avoids one polling cycle.)
+        if (!queue_results.is_running()) {
+            SRV_DBG("%s", "result queue terminated, stopping wait\n");
+            return nullptr;
+        }
+
         server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
         if (result == nullptr) {
+            // recv returned nullptr -- either timeout, or queue terminated.
+            if (!queue_results.is_running()) {
+                SRV_DBG("%s", "result queue terminated during wait, stopping\n");
+                return nullptr;
+            }
             // timeout, check stop condition
             if (should_stop()) {
                 SRV_WRN("%s", "stopping wait for next result due to should_stop condition (adjust the --timeout argument if needed)\n");
@@ -430,6 +442,7 @@ server_response_reader::batch_response server_response_reader::wait_for_all(cons
 }
 
 void server_response_reader::stop() {
+    // bulk-remove first; the per-id remove inside the loop below was redundant.
     queue_results.remove_waiting_task_ids(id_tasks);
     if (has_next() && !cancelled) {
         // if tasks is not finished yet, cancel them
@@ -437,10 +450,9 @@ void server_response_reader::stop() {
         std::vector<server_task> cancel_tasks;
         cancel_tasks.reserve(id_tasks.size());
         for (const auto & id_task : id_tasks) {
-            SRV_WRN("cancel task, id_task = %d\n", id_task);
+            SRV_WRN("cancel task, id_task = %" PRIu64 "\n", id_task);
             server_task task(SERVER_TASK_TYPE_CANCEL);
             task.id_target = id_task;
-            queue_results.remove_waiting_task_id(id_task);
             cancel_tasks.push_back(std::move(task));
         }
         // push to beginning of the queue, so it has highest priority

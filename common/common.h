@@ -637,6 +637,21 @@ struct common_params {
     // enable built-in tools
     std::vector<std::string> server_tools;
 
+    // Transport selection. Both can be enabled simultaneously and serve the
+    // same handler table (see server_routes::routes()). At least one must be
+    // enabled or the server refuses to start.
+    bool enable_http = true;
+    bool enable_zmq  = false;
+
+    // ZMQ transport tunables (consumed only when enable_zmq=true).
+    // bind list is repeatable on the CLI; empty defaults to ipc:///tmp/llama-server-<PID>.sock.
+    std::vector<std::string> zmq_bind_endpoints;
+    int32_t                  zmq_workers = 0;   // 0 = auto (n_parallel + 2)
+    int32_t                  zmq_hwm     = 64;  // ZMQ_SNDHWM / ZMQ_RCVHWM cap
+
+    // RAM budget for in-process session storage (T3-S2). 0 = unbounded.
+    int64_t sessions_max_bytes = 0;
+
     // router server configs
     std::string models_dir    = ""; // directory containing models for the router server
     std::string models_preset = ""; // directory containing model presets for the router server
