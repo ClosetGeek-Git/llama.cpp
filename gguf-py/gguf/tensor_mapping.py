@@ -1283,10 +1283,6 @@ class TensorNameMap:
         MODEL_TENSOR.CLS_NORM: (
             "head.norm",        # modern-bert
         ),
-
-        MODEL_TENSOR.CLS_NORM: (
-            "head.norm", # modern-bert
-        ),
         #############################################################################
 
         MODEL_TENSOR.CONVNEXT_DW: (

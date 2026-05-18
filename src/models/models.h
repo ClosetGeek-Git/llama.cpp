@@ -280,6 +280,16 @@ struct llama_model_bert : public llama_model_base {
 };
 
 
+// DistilBERT shares BERT's hparams loading, tensor topology, and graph. We
+// inherit from llama_model_bert so load_arch_tensors() comes for free; the
+// only architectural difference (ReLU vs tanh in the classifier head) is
+// dispatched inside build_pooling() on model.arch.
+struct llama_model_distilbert : public llama_model_bert {
+    llama_model_distilbert(const struct llama_model_params & params) : llama_model_bert(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+};
+
+
 struct llama_model_jina_bert_v2 : public llama_model_base {
     llama_model_jina_bert_v2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

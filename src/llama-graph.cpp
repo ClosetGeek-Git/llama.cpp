@@ -2784,7 +2784,10 @@ void llm_graph_context::build_pooling(
                     if (arch == LLM_ARCH_DISTILBERT) {
                         cur = ggml_relu(ctx0, cur);
                     } else if (arch == LLM_ARCH_MODERN_BERT) {
-                        cur = ggml_gelu(ctx0, cur);
+                        // ModernBERT uses nn.GELU (exact, erf-based) in the
+                        // classifier head. ggml_gelu is the tanh approximation;
+                        // we need ggml_gelu_erf to match HuggingFace output.
+                        cur = ggml_gelu_erf(ctx0, cur);
                     } else {
                         cur = ggml_tanh(ctx0, cur);
                     }

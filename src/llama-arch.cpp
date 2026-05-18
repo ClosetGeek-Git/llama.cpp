@@ -21,6 +21,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_STARCODER,        "starcoder"        },
     { LLM_ARCH_REFACT,           "refact"           },
     { LLM_ARCH_BERT,             "bert"             },
+    { LLM_ARCH_DISTILBERT,       "distilbert"       },
     { LLM_ARCH_MODERN_BERT,      "modern-bert"      },
     { LLM_ARCH_NOMIC_BERT,       "nomic-bert"       },
     { LLM_ARCH_NOMIC_BERT_MOE,   "nomic-bert-moe"   },

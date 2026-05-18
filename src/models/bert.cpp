@@ -29,7 +29,7 @@ void llama_model_bert::load_arch_tensors(llama_model_loader &) {
     tok_embd     = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
     type_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_TYPES, "weight"), {n_embd, n_token_types}, TENSOR_NOT_REQUIRED);
 
-    if (arch == LLM_ARCH_BERT) {
+    if (arch == LLM_ARCH_BERT || arch == LLM_ARCH_DISTILBERT) {
         pos_embd = create_tensor(tn(LLM_TENSOR_POS_EMBD,    "weight"), {n_embd, n_ctx_train}, 0);
 
         cls   = create_tensor(tn(LLM_TENSOR_CLS, "weight"), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);

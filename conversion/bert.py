@@ -23,7 +23,10 @@ class BertModel(TextModel):
         self.vocab_size = None
 
         if cls_out_labels := self.hparams.get("id2label"):
-            if len(cls_out_labels) == 2 and cls_out_labels[0] == "LABEL_0":
+            # id2label keys can be int (e.g. 0) or str (e.g. "0") depending on
+            # the source config; accept either before pruning dummy labels.
+            first_label = cls_out_labels.get(0) or cls_out_labels.get("0")
+            if len(cls_out_labels) == 2 and first_label == "LABEL_0":
                 # Remove dummy labels added by AutoConfig
                 cls_out_labels = None
         self.cls_out_labels = cls_out_labels
@@ -241,7 +244,9 @@ class BertModel(TextModel):
 
 @ModelBase.register("DistilBertModel", "DistilBertForMaskedLM", "DistilBertForSequenceClassification")
 class DistilBertModel(BertModel):
-    model_arch = gguf.MODEL_ARCH.BERT
+    # Distinct arch so the classifier head uses ReLU (DistilBERT's activation)
+    # rather than tanh (default BERT). See build_pooling() in src/llama-graph.cpp.
+    model_arch = gguf.MODEL_ARCH.DISTILBERT
 
     def set_gguf_parameters(self):
         self.gguf_writer.add_layer_norm_eps(1e-12)
@@ -594,6 +599,12 @@ class ModernBertModel(BertModel):
             self.gguf_writer.add_sliding_window_pattern(sliding_window_pattern)
         self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.NONE)
         self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
+
+        # ModernBERT classification head uses mean pooling + dense -> GELU -> LayerNorm
+        # -> classifier. The actual pooling is dispatched by arch in build_pooling()
+        # (see src/llama-graph.cpp); RANK is what activates the dense + classifier path.
+        if self.hparams.get("classifier_pooling"):
+            self.gguf_writer.add_pooling_type(gguf.PoolingType.RANK)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
