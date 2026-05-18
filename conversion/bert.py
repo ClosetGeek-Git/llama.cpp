@@ -610,6 +610,10 @@ class ModernBertModel(BertModel):
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
 
+        # decoder.* are MLM head tensors; classification/embedding builds don't need them.
+        if name.startswith("decoder."):
+            return None
+
         if name.startswith("model."):
             name = name[6:]
 
