@@ -49,6 +49,9 @@
 /debug
 /libllama.so
 /llama-*
+
+# Ignore server-coro for all clones/pushes
+tools/server-coro/
 /vulkan-shaders-gen
 /rpc-server
 /out/
