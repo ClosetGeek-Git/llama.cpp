@@ -49,8 +49,6 @@
 /libllama.so
 /llama-*
 
-# Ignore server-coro for all clones/pushes
-tools/server-coro/
 /vulkan-shaders-gen
 /rpc-server
 /out/
@@ -159,29 +157,15 @@ flake.lock
 # emscripten
 a.out.*
 
-# tools/server-coro/ is already ignored wholesale earlier in this file
-# (privacy + build artifacts). Granular patterns kept as a hedge in case
-# the wholesale ignore is ever loosened.
+# tools/server-coro build artifacts (source files are tracked on this branch)
 /tools/server-coro/node_modules
 /tools/server-coro/*.lo
-/tools/server-coro/*.dep
 /tools/server-coro/*.la
-/tools/server-coro/Makefile*
-/tools/server-coro/make.sh
-/tools/server-coro/libtool
-/tools/server-coro/modules
-/tools/server-coro/build
 /tools/server-coro/.libs
 /tools/server-coro/autom4te.cache
-/tools/server-coro/config.h
-/tools/server-coro/config.h.in
+/tools/server-coro/build
 /tools/server-coro/config.log
-/tools/server-coro/config.nice
 /tools/server-coro/config.status
-/tools/server-coro/configure
-/tools/server-coro/configure.ac
-/tools/server-coro/package-lock.json
-/tools/server-coro/*.php
 
 # AGENTS (from upstream)
 
